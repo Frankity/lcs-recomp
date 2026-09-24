@@ -1,0 +1,3 @@
+#define LCSNATIVE_ICON 1
+
+LCSNATIVE_ICON ICON "lcsnative.ico"
