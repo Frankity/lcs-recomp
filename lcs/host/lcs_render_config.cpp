@@ -233,6 +233,18 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.InternalScale must be between 1 and 8");
         return;
     }
+    if (key == "bloom") {
+        const std::string mode = lowercase_copy(trim_copy(value));
+        if (mode == "off" || mode == "false" || mode == "0" || mode == "none")
+            config.rendering.bloom = BloomMode::Off;
+        else if (mode == "low" || mode == "on" || mode == "true" || mode == "1")
+            config.rendering.bloom = BloomMode::Low;
+        else if (mode == "high")
+            config.rendering.bloom = BloomMode::High;
+        else
+            warning(config, line, "Rendering.Bloom expects Off, Low or High");
+        return;
+    }
     if (key == "msaa" || key == "multisampling") {
         std::uint32_t samples = 0u;
         if (!parse_u32(value, 1u, 16u, samples)) {
@@ -791,6 +803,15 @@ const char *internal_resolution_mode_name(InternalResolutionMode mode) noexcept 
     case InternalResolutionMode::Desktop: return "Desktop";
     }
     return "Unknown";
+}
+
+const char *bloom_mode_name(BloomMode mode) noexcept {
+    switch (mode) {
+    case BloomMode::Off: return "Off";
+    case BloomMode::Low: return "Low";
+    case BloomMode::High: return "High";
+    }
+    return "Off";
 }
 
 const char *rendering_backend_name(RenderingBackend backend) noexcept {

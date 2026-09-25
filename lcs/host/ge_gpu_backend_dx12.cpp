@@ -11,8 +11,11 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <span>
 #include <sstream>
 #include <unordered_map>
@@ -44,6 +47,7 @@ constexpr std::uint32_t kReferenceHeight = 272u;
 constexpr std::size_t kGeometryUploadCapacity = 64u * 1024u * 1024u;
 constexpr std::size_t kTextureUploadCapacity = 32u * 1024u * 1024u;
 constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+constexpr DXGI_FORMAT kBloomFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT;
 constexpr UINT kFrameCount = 2u;
 constexpr UINT kSrvCapacity = 65536u;
@@ -148,6 +152,15 @@ struct Dx12FramebufferTarget {
     std::uint64_t last_render_epoch{};
 };
 
+// One half of a bloom ping-pong pair: an RGBA16F texture that is both rendered to and sampled.
+struct Dx12BloomTarget {
+    ComPtr<ID3D12Resource> texture;
+    std::uint32_t rtv_index{};
+    std::uint32_t srv_index{};
+    std::uint32_t width{};
+    std::uint32_t height{};
+};
+
 struct Dx12RetiredSrv {
     std::uint32_t index{};
     UINT64 fence_value{};
@@ -227,6 +240,11 @@ struct Dx12GeState {
     std::uint32_t swap_width{};
     std::uint32_t swap_height{};
     ComPtr<ID3D12PipelineState> present_pipeline;
+    // bloom: bright/down/blur/add pipelines and two half-resolution ping-pong pairs (1/4, 1/8)
+    std::array<ComPtr<ID3D12PipelineState>, 4> bloom_pipelines;
+    std::array<Dx12BloomTarget, 4> bloom_targets;
+    bool bloom_ready{};
+    bool bloom_failed{};
     ComPtr<ID3DBlob> present_vertex_shader;
     ComPtr<ID3DBlob> present_pixel_shader;
     bool direct_present_ok{};
@@ -626,25 +644,125 @@ D3D12_COMPARISON_FUNC depth_compare(std::uint32_t function) noexcept {
     return D3D12_COMPARISON_FUNC_ALWAYS;
 }
 
-std::size_t blend_variant(const GeGpuDrawDescriptor &draw) noexcept {
-    if (!draw.blend_enabled || draw.clear_mode) return 0u;
-    const std::uint32_t eq = draw.blend_equation & 7u;
-    const std::uint32_t src = draw.blend_source_factor & 0xFu;
-    const std::uint32_t dst = draw.blend_dest_factor & 0xFu;
-    if (eq == 0u && src == 2u && dst == 3u) return 1u;
-    if (eq == 0u && src == 10u && dst == 10u) {
-        const std::uint32_t fs = draw.blend_fix_source & 0x00FFFFFFu;
-        const std::uint32_t fd = draw.blend_fix_dest & 0x00FFFFFFu;
-        if (fs == 0x00FFFFFFu && fd == 0u) return 2u;
-        if (fs == 0x00FFFFFFu && fd == 0x00FFFFFFu) return 3u;
-        bool complements = true;
-        for (std::uint32_t shift = 0u; shift < 24u; shift += 8u)
-            complements &= (((fs >> shift) & 0xFFu) + ((fd >> shift) & 0xFFu)) == 0xFFu;
-        if (complements) return 4u;
+// The GE blend state translated to Direct3D 12. Every source/destination factor the GE has is
+// mapped; the "double alpha" factors have no D3D12 equivalent and are approximated by the plain
+// alpha ones. A fixed colour becomes ZERO, ONE or the (single, per draw) blend factor.
+struct ResolvedBlend {
+    bool enabled{};
+    bool uses_factor{};
+    bool approximated{};
+    std::uint32_t factor{};
+    D3D12_BLEND_OP op{D3D12_BLEND_OP_ADD};
+    D3D12_BLEND src{D3D12_BLEND_ONE};
+    D3D12_BLEND dst{D3D12_BLEND_ZERO};
+
+    [[nodiscard]] std::uint64_t key() const noexcept {
+        if (!enabled) return 0u;
+        return 1u | (static_cast<std::uint64_t>(op) << 1u) |
+               (static_cast<std::uint64_t>(src) << 4u) | (static_cast<std::uint64_t>(dst) << 9u);
     }
-    if (eq == 0u && src == 2u && dst == 10u &&
-        (draw.blend_fix_dest & 0x00FFFFFFu) == 0x00FFFFFFu) return 5u;
-    return 0u;
+};
+
+ResolvedBlend resolve_blend(const GeGpuDrawDescriptor &draw) noexcept {
+    ResolvedBlend out;
+    if (!draw.blend_enabled || draw.clear_mode) return out;
+
+    const std::uint32_t equation = draw.blend_equation & 7u;
+    const std::uint32_t source_factor = draw.blend_source_factor & 0xFu;
+    const std::uint32_t dest_factor = draw.blend_dest_factor & 0xFu;
+    const auto fixed_colour = [&](std::uint32_t colour) noexcept {
+        colour &= 0x00FFFFFFu;
+        if (colour == 0u) return D3D12_BLEND_ZERO;
+        if (colour == 0x00FFFFFFu) return D3D12_BLEND_ONE;
+        if (!out.uses_factor) {
+            out.uses_factor = true;
+            out.factor = colour;
+            return D3D12_BLEND_BLEND_FACTOR;
+        }
+        if (colour == out.factor) return D3D12_BLEND_BLEND_FACTOR;
+        if (colour == (~out.factor & 0x00FFFFFFu)) return D3D12_BLEND_INV_BLEND_FACTOR;
+        out.approximated = true;
+        return D3D12_BLEND_BLEND_FACTOR;
+    };
+    const auto map_factor = [&](std::uint32_t factor, D3D12_BLEND colour_variant,
+                                D3D12_BLEND inverse_variant, std::uint32_t fixed) noexcept {
+        switch (factor) {
+        case 0u: return colour_variant;
+        case 1u: return inverse_variant;
+        case 2u: return D3D12_BLEND_SRC_ALPHA;
+        case 3u: return D3D12_BLEND_INV_SRC_ALPHA;
+        case 4u: return D3D12_BLEND_DEST_ALPHA;
+        case 5u: return D3D12_BLEND_INV_DEST_ALPHA;
+        case 6u: out.approximated = true; return D3D12_BLEND_SRC_ALPHA;
+        case 7u: out.approximated = true; return D3D12_BLEND_INV_SRC_ALPHA;
+        case 8u: out.approximated = true; return D3D12_BLEND_DEST_ALPHA;
+        case 9u: out.approximated = true; return D3D12_BLEND_INV_DEST_ALPHA;
+        case 10u: return fixed_colour(fixed);
+        default: out.approximated = true; return D3D12_BLEND_ONE;
+        }
+    };
+    out.src = map_factor(source_factor, D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR,
+                         draw.blend_fix_source);
+    out.dst = map_factor(dest_factor, D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR,
+                         draw.blend_fix_dest);
+    switch (equation) {
+    case 0u: out.op = D3D12_BLEND_OP_ADD; break;
+    case 1u: out.op = D3D12_BLEND_OP_SUBTRACT; break;
+    case 2u: out.op = D3D12_BLEND_OP_REV_SUBTRACT; break;
+    case 3u: out.op = D3D12_BLEND_OP_MIN; break;
+    case 4u: out.op = D3D12_BLEND_OP_MAX; break;
+    default: out.op = D3D12_BLEND_OP_ADD; out.approximated = true; break;
+    }
+    if (out.op == D3D12_BLEND_OP_MIN || out.op == D3D12_BLEND_OP_MAX) {
+        out.src = D3D12_BLEND_ONE;  // factors are ignored by min/max
+        out.dst = D3D12_BLEND_ONE;
+        out.uses_factor = false;
+    }
+    // source replace (src = 1, dst = 0) is the same as no blending
+    if (out.op == D3D12_BLEND_OP_ADD && out.src == D3D12_BLEND_ONE && out.dst == D3D12_BLEND_ZERO) {
+        out.uses_factor = false;
+        return out;
+    }
+    out.enabled = true;
+    return out;
+}
+
+// Alpha channel factors: colour factors are not allowed there, and the framebuffer alpha keeps
+// the value the game wrote unless the game blends alpha explicitly.
+D3D12_BLEND blend_alpha_source(D3D12_BLEND src) noexcept {
+    switch (src) {
+    case D3D12_BLEND_SRC_ALPHA: return D3D12_BLEND_ONE;
+    case D3D12_BLEND_DEST_COLOR: return D3D12_BLEND_DEST_ALPHA;
+    case D3D12_BLEND_INV_DEST_COLOR: return D3D12_BLEND_INV_DEST_ALPHA;
+    case D3D12_BLEND_BLEND_FACTOR: return D3D12_BLEND_ONE;
+    case D3D12_BLEND_INV_BLEND_FACTOR: return D3D12_BLEND_ZERO;
+    default: return src;
+    }
+}
+D3D12_BLEND blend_alpha_dest(D3D12_BLEND dst) noexcept {
+    switch (dst) {
+    case D3D12_BLEND_SRC_COLOR: return D3D12_BLEND_SRC_ALPHA;
+    case D3D12_BLEND_INV_SRC_COLOR: return D3D12_BLEND_INV_SRC_ALPHA;
+    case D3D12_BLEND_BLEND_FACTOR: return D3D12_BLEND_ONE;
+    case D3D12_BLEND_INV_BLEND_FACTOR: return D3D12_BLEND_ZERO;
+    default: return dst;
+    }
+}
+
+// Which GE blend states the game really uses, counted per distinct state. Printed at exit when
+// LCS_BLEND_DIAG is set, to see what a scene needs.
+std::mutex g_blend_usage_mutex;
+std::map<std::array<std::uint32_t, 7>, std::uint64_t> g_blend_usage;
+
+void record_blend_usage(const GeGpuDrawDescriptor &draw, const ResolvedBlend &blend) {
+    static const bool enabled = std::getenv("LCS_BLEND_DIAG") != nullptr;
+    if (!enabled) return;
+    const std::array<std::uint32_t, 7> key{
+        draw.blend_equation & 7u, draw.blend_source_factor & 0xFu, draw.blend_dest_factor & 0xFu,
+        draw.blend_fix_source & 0x00FFFFFFu, draw.blend_fix_dest & 0x00FFFFFFu,
+        draw.texture_enabled ? 1u : 0u, blend.approximated ? 1u : (blend.enabled ? 0u : 2u)};
+    const std::lock_guard<std::mutex> guard(g_blend_usage_mutex);
+    ++g_blend_usage[key];
 }
 
 std::uint8_t color_write_mask(const GeGpuDrawDescriptor &draw) noexcept {
@@ -660,7 +778,7 @@ std::uint64_t pipeline_key(const GeGpuDrawDescriptor &draw) noexcept {
     std::uint64_t key = static_cast<std::uint64_t>(draw.depth_test_enabled ? 1u : 0u);
     key |= static_cast<std::uint64_t>(draw.depth_write_enabled ? 1u : 0u) << 1u;
     key |= static_cast<std::uint64_t>(draw.depth_function & 7u) << 2u;
-    key |= static_cast<std::uint64_t>(blend_variant(draw) & 7u) << 5u;
+    key |= resolve_blend(draw).key() << 16u;
     key |= static_cast<std::uint64_t>(color_write_mask(draw) & 0xFu) << 8u;
     return key;
 }
@@ -706,9 +824,12 @@ bool adjacent_batch_merge_compatible(const Dx12Batch &a, const Dx12Batch &b) noe
     if (a.draw.scissor_x0 != b.draw.scissor_x0 || a.draw.scissor_y0 != b.draw.scissor_y0 ||
         a.draw.scissor_x1 != b.draw.scissor_x1 || a.draw.scissor_y1 != b.draw.scissor_y1)
         return false;
-    if (blend_variant(a.draw) == 4u &&
-        (a.draw.blend_fix_source & 0x00FFFFFFu) !=
-        (b.draw.blend_fix_source & 0x00FFFFFFu)) return false;
+    {
+        const ResolvedBlend blend_a = resolve_blend(a.draw);
+        const ResolvedBlend blend_b = resolve_blend(b.draw);
+        if (blend_a.uses_factor != blend_b.uses_factor ||
+            (blend_a.uses_factor && blend_a.factor != blend_b.factor)) return false;
+    }
     const Dx12PixelConstants pa = make_pixel_constants(a.draw, a.draw.texture_enabled);
     const Dx12PixelConstants pb = make_pixel_constants(b.draw, b.draw.texture_enabled);
     if (std::memcmp(&pa, &pb, sizeof(pa)) != 0) return false;
@@ -1365,41 +1486,26 @@ ComPtr<ID3D12PipelineState> create_pipeline(Dx12GeState &s,
     pso.BlendState.IndependentBlendEnable = FALSE;
     D3D12_RENDER_TARGET_BLEND_DESC blend{};
     blend.RenderTargetWriteMask = color_write_mask(draw);
-    const std::size_t variant = blend_variant(draw);
-    if (variant != 0u && variant != 2u) blend.BlendEnable = TRUE;
-    blend.SrcBlend = D3D12_BLEND_ONE;
-    blend.DestBlend = D3D12_BLEND_ZERO;
-    blend.BlendOp = D3D12_BLEND_OP_ADD;
-    blend.SrcBlendAlpha = D3D12_BLEND_ONE;
-    blend.DestBlendAlpha = D3D12_BLEND_ZERO;
-    blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    switch (variant) {
-    case 1u:
-        blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-        blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-        blend.SrcBlendAlpha = D3D12_BLEND_ONE;
-        blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-        break;
-    case 3u:
+    const ResolvedBlend resolved = resolve_blend(draw);
+    if (resolved.enabled) {
+        blend.BlendEnable = TRUE;
+        blend.SrcBlend = resolved.src;
+        blend.DestBlend = resolved.dst;
+        blend.BlendOp = resolved.op;
+        blend.SrcBlendAlpha = blend_alpha_source(resolved.src);
+        blend.DestBlendAlpha = blend_alpha_dest(resolved.dst);
+        blend.BlendOpAlpha = resolved.op;
+        if (resolved.op == D3D12_BLEND_OP_MIN || resolved.op == D3D12_BLEND_OP_MAX) {
+            blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.DestBlendAlpha = D3D12_BLEND_ONE;
+        }
+    } else {
         blend.SrcBlend = D3D12_BLEND_ONE;
-        blend.DestBlend = D3D12_BLEND_ONE;
-        blend.SrcBlendAlpha = D3D12_BLEND_ONE;
-        blend.DestBlendAlpha = D3D12_BLEND_ONE;
-        break;
-    case 4u:
-        blend.SrcBlend = D3D12_BLEND_BLEND_FACTOR;
-        blend.DestBlend = D3D12_BLEND_INV_BLEND_FACTOR;
+        blend.DestBlend = D3D12_BLEND_ZERO;
+        blend.BlendOp = D3D12_BLEND_OP_ADD;
         blend.SrcBlendAlpha = D3D12_BLEND_ONE;
         blend.DestBlendAlpha = D3D12_BLEND_ZERO;
-        break;
-    case 5u:
-        blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-        blend.DestBlend = D3D12_BLEND_ONE;
-        blend.SrcBlendAlpha = D3D12_BLEND_ONE;
-        blend.DestBlendAlpha = D3D12_BLEND_ONE;
-        break;
-    default:
-        break;
+        blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     }
     pso.BlendState.RenderTarget[0] = blend;
     pso.DepthStencilState.DepthEnable = draw.depth_test_enabled ? TRUE : FALSE;
@@ -1619,12 +1725,242 @@ std::uint32_t present_sampler(Dx12GeState &s) noexcept {
 
 
 
+// ---- bloom --------------------------------------------------------------------------------
+// The scene is sampled at the end of the frame: bright pixels are extracted into a 1/4-size
+// texture, blurred, downsampled to 1/8 and blurred again; both are then added on top of the
+// presented image. Everything runs on small RGBA16F textures, so the cost is a few tenths of a
+// millisecond.
+enum BloomPipeline : std::size_t { kBloomBright = 0u, kBloomBlur = 1u, kBloomDown = 2u, kBloomAdd = 3u };
+
+struct BloomLook {
+    float threshold;
+    float near_gain;
+    float far_gain;
+};
+
+BloomLook bloom_look(BloomMode mode) noexcept {
+    switch (mode) {
+    case BloomMode::High: return {0.72f, 0.55f, 0.65f};
+    case BloomMode::Low: return {0.85f, 0.32f, 0.32f};
+    case BloomMode::Off: break;
+    }
+    return {1.0f, 0.0f, 0.0f};
+}
+
+void bloom_status(const std::string &message) {
+    std::cerr << "[bloom] " << message << "\n";
+    runtime_log_error("dx12 ge bloom", message);
+}
+
+ComPtr<ID3D12PipelineState> create_bloom_pipeline(Dx12GeState &s, const char *entry,
+                                                  DXGI_FORMAT format, bool additive) noexcept {
+    ComPtr<ID3DBlob> pixel_shader, errors;
+    const char *source = kGePresentShaderHlsl;
+    if (FAILED(D3DCompile(source, std::strlen(source), "LCSNativeDX12GEBloom", nullptr, nullptr,
+                          entry, "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0u, &pixel_shader, &errors)))
+        return {};
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = s.root_signature.Get();
+    pso.VS = {s.present_vertex_shader->GetBufferPointer(), s.present_vertex_shader->GetBufferSize()};
+    pso.PS = {pixel_shader->GetBufferPointer(), pixel_shader->GetBufferSize()};
+    pso.SampleMask = UINT_MAX;
+    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.RasterizerState.DepthClipEnable = TRUE;
+    D3D12_RENDER_TARGET_BLEND_DESC &blend = pso.BlendState.RenderTarget[0];
+    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    blend.SrcBlend = D3D12_BLEND_ONE;
+    blend.DestBlend = additive ? D3D12_BLEND_ONE : D3D12_BLEND_ZERO;
+    blend.BlendOp = D3D12_BLEND_OP_ADD;
+    blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blend.DestBlendAlpha = additive ? D3D12_BLEND_ONE : D3D12_BLEND_ZERO;
+    blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blend.BlendEnable = additive ? TRUE : FALSE;
+    pso.DepthStencilState.DepthEnable = FALSE;
+    pso.DepthStencilState.StencilEnable = FALSE;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 1u;
+    pso.RTVFormats[0] = format;
+    pso.SampleDesc.Count = 1u;
+    ComPtr<ID3D12PipelineState> pipeline;
+    if (FAILED(s.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&pipeline)))) return {};
+    return pipeline;
+}
+
+bool ensure_bloom(Dx12GeState &s) noexcept {
+    if (s.bloom_ready) return true;
+    if (s.bloom_failed) return false;
+    s.bloom_failed = true;  // stays set unless everything below succeeds
+    if (!s.device || !s.present_vertex_shader || !s.root_signature) return false;
+    if (s.next_rtv + 4u > kFramebufferTargetCapacity || s.next_srv + 4u >= kSrvCapacity) {
+        bloom_status("no descriptors left for the bloom targets");
+        return false;
+    }
+
+    s.bloom_pipelines[kBloomBright] = create_bloom_pipeline(s, "BloomBrightPS", kBloomFormat, false);
+    s.bloom_pipelines[kBloomBlur] = create_bloom_pipeline(s, "BloomBlurPS", kBloomFormat, false);
+    s.bloom_pipelines[kBloomDown] = create_bloom_pipeline(s, "BloomDownPS", kBloomFormat, false);
+    s.bloom_pipelines[kBloomAdd] = create_bloom_pipeline(s, "BloomAddPS", kColorFormat, true);
+    for (const auto &pipeline : s.bloom_pipelines) {
+        if (!pipeline) {
+            bloom_status("could not create a bloom pipeline; bloom disabled");
+            return false;
+        }
+    }
+
+    const std::uint32_t quarter_w = std::max(1u, (s.target_width + 3u) / 4u);
+    const std::uint32_t quarter_h = std::max(1u, (s.target_height + 3u) / 4u);
+    const std::uint32_t eighth_w = std::max(1u, (s.target_width + 7u) / 8u);
+    const std::uint32_t eighth_h = std::max(1u, (s.target_height + 7u) / 8u);
+    const std::array<std::array<std::uint32_t, 2>, 4> sizes{{
+        {quarter_w, quarter_h}, {quarter_w, quarter_h}, {eighth_w, eighth_h}, {eighth_w, eighth_h}}};
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    for (std::size_t i = 0u; i < s.bloom_targets.size(); ++i) {
+        Dx12BloomTarget &target = s.bloom_targets[i];
+        target.width = sizes[i][0];
+        target.height = sizes[i][1];
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = target.width;
+        desc.Height = target.height;
+        desc.DepthOrArraySize = 1u;
+        desc.MipLevels = 1u;
+        desc.Format = kBloomFormat;
+        desc.SampleDesc.Count = 1u;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE clear{};
+        clear.Format = kBloomFormat;
+        if (FAILED(s.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                     &clear, IID_PPV_ARGS(&target.texture)))) {
+            bloom_status("could not create a bloom texture; bloom disabled");
+            return false;
+        }
+        target.rtv_index = s.next_rtv++;
+        target.srv_index = s.next_srv++;
+        s.device->CreateRenderTargetView(target.texture.Get(), nullptr, rtv_cpu(s, target.rtv_index));
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Format = kBloomFormat;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1u;
+        s.device->CreateShaderResourceView(target.texture.Get(), &srv, srv_cpu(s, target.srv_index));
+    }
+    s.bloom_failed = false;
+    s.bloom_ready = true;
+    bloom_status("bloom ready (" + std::to_string(s.bloom_targets[0].width) + "x" +
+                      std::to_string(s.bloom_targets[0].height) + " and " +
+                      std::to_string(s.bloom_targets[2].width) + "x" +
+                      std::to_string(s.bloom_targets[2].height) + ")");
+    return true;
+}
+
+void bloom_draw(Dx12GeState &s, ID3D12PipelineState *pipeline, std::uint32_t source_srv,
+                std::uint32_t sampler, float texel_x, float texel_y, float dir_x, float dir_y,
+                float threshold, float gain) noexcept {
+    s.list->SetPipelineState(pipeline);
+    s.list->SetGraphicsRootDescriptorTable(0u, srv_gpu(s, source_srv));
+    s.list->SetGraphicsRootDescriptorTable(1u, sampler_gpu(s, sampler));
+    const float constants[8]{texel_x, texel_y, dir_x, dir_y, threshold, gain, 0.0f, 0.0f};
+    s.list->SetGraphicsRoot32BitConstants(3u, 8u, constants, 0u);
+    s.list->DrawInstanced(3u, 1u, 0u, 0u);
+}
+
+void bloom_pass(Dx12GeState &s, ID3D12PipelineState *pipeline, std::uint32_t source_srv,
+                std::uint32_t source_width, std::uint32_t source_height, Dx12BloomTarget &dest,
+                std::uint32_t sampler, float dir_x, float dir_y, float threshold) noexcept {
+    transition(s.list.Get(), dest.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_cpu(s, dest.rtv_index);
+    s.list->OMSetRenderTargets(1u, &rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(dest.width),
+                                  static_cast<float>(dest.height), 0.0f, 1.0f};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(dest.width), static_cast<LONG>(dest.height)};
+    s.list->RSSetViewports(1u, &viewport);
+    s.list->RSSetScissorRects(1u, &scissor);
+    bloom_draw(s, pipeline, source_srv, sampler, 1.0f / static_cast<float>(source_width),
+               1.0f / static_cast<float>(source_height), dir_x, dir_y, threshold, 1.0f);
+    transition(s.list.Get(), dest.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+std::uint32_t bloom_sampler(Dx12GeState &s) noexcept {
+    GeGpuDrawDescriptor draw{};
+    draw.texture_min_linear = true;
+    draw.texture_mag_linear = true;
+    draw.texture_clamp_u = true;
+    draw.texture_clamp_v = true;
+    return ensure_sampler(s, draw);
+}
+
+// Renders the bloom textures from `source`. Returns false when bloom is off or unavailable.
+bool record_bloom(Dx12GeState &s, const Dx12FramebufferTarget &source) noexcept {
+    const BloomMode mode = lcs_render_configuration().rendering.bloom;
+    if (mode == BloomMode::Off || !ensure_bloom(s)) return false;
+    const BloomLook look = bloom_look(mode);
+    const std::uint32_t sampler = bloom_sampler(s);
+    Dx12BloomTarget &q0 = s.bloom_targets[0];
+    Dx12BloomTarget &q1 = s.bloom_targets[1];
+    Dx12BloomTarget &e0 = s.bloom_targets[2];
+    Dx12BloomTarget &e1 = s.bloom_targets[3];
+
+    s.list->SetGraphicsRootSignature(s.root_signature.Get());
+    ID3D12DescriptorHeap *heaps[]{s.srv_heap.Get(), s.sampler_heap.Get()};
+    s.list->SetDescriptorHeaps(2u, heaps);
+    s.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    ID3D12PipelineState *bright = s.bloom_pipelines[kBloomBright].Get();
+    ID3D12PipelineState *blur = s.bloom_pipelines[kBloomBlur].Get();
+    ID3D12PipelineState *down = s.bloom_pipelines[kBloomDown].Get();
+    bloom_pass(s, bright, source.srv_index, s.target_width, s.target_height, q0, sampler, 0.0f, 0.0f,
+               look.threshold);
+    for (int i = 0; i < 2; ++i) {
+        bloom_pass(s, blur, q0.srv_index, q0.width, q0.height, q1, sampler, 1.0f, 0.0f, 0.0f);
+        bloom_pass(s, blur, q1.srv_index, q1.width, q1.height, q0, sampler, 0.0f, 1.0f, 0.0f);
+    }
+    bloom_pass(s, down, q0.srv_index, q0.width, q0.height, e0, sampler, 0.0f, 0.0f, 0.0f);
+    for (int i = 0; i < 2; ++i) {
+        bloom_pass(s, blur, e0.srv_index, e0.width, e0.height, e1, sampler, 1.0f, 0.0f, 0.0f);
+        bloom_pass(s, blur, e1.srv_index, e1.width, e1.height, e0, sampler, 0.0f, 1.0f, 0.0f);
+    }
+    return true;
+}
+
+// Adds the bloom textures to the render target that is currently bound (viewport already set).
+// With LCS_BLOOM_SPLIT set, only the right half of the picture gets it, to compare in one frame.
+void composite_bloom(Dx12GeState &s, const PresentationRectangle &rect) noexcept {
+    static const bool split = std::getenv("LCS_BLOOM_SPLIT") != nullptr;
+    if (split) {
+        const D3D12_RECT right_half{rect.x + std::max(1, rect.width) / 2, rect.y,
+                                    rect.x + std::max(1, rect.width), rect.y + std::max(1, rect.height)};
+        s.list->RSSetScissorRects(1u, &right_half);
+    }
+    BloomLook look = bloom_look(lcs_render_configuration().rendering.bloom);
+    static const float gain_scale = [] {
+        const char *text = std::getenv("LCS_BLOOM_GAIN");  // tuning aid: multiplies both gains
+        const float value = text != nullptr ? static_cast<float>(std::atof(text)) : 1.0f;
+        return value > 0.0f ? value : 1.0f;
+    }();
+    look.near_gain *= gain_scale;
+    look.far_gain *= gain_scale;
+    const std::uint32_t sampler = bloom_sampler(s);
+    ID3D12PipelineState *add = s.bloom_pipelines[kBloomAdd].Get();
+    bloom_draw(s, add, s.bloom_targets[0].srv_index, sampler, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+               look.near_gain);
+    bloom_draw(s, add, s.bloom_targets[2].srv_index, sampler, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+               look.far_gain);
+}
+
 bool record_direct_present(Dx12GeState &s, Dx12FramebufferTarget &source,
                            std::string &error) noexcept {
     if (!ensure_swapchain(s, error)) return false;
     const UINT index = s.swapchain->GetCurrentBackBufferIndex();
     ID3D12Resource *backbuffer = s.backbuffers[index].Get();
     resolve_target_for_sampling(s, source, false);
+    const bool bloom_recorded = record_bloom(s, source);
     transition(s.list.Get(), backbuffer, D3D12_RESOURCE_STATE_PRESENT,
                D3D12_RESOURCE_STATE_RENDER_TARGET);
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = swap_rtv(s, index);
@@ -1654,6 +1990,7 @@ bool record_direct_present(Dx12GeState &s, Dx12FramebufferTarget &source,
         3u, static_cast<UINT>(present_constants.size()), present_constants.data(), 0u);
     s.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     s.list->DrawInstanced(3u, 1u, 0u, 0u);
+    if (bloom_recorded) composite_bloom(s, rect);
     transition(s.list.Get(), backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET,
                D3D12_RESOURCE_STATE_PRESENT);
     return true;
@@ -2146,6 +2483,10 @@ void destroy_backend(Dx12GeState &s) noexcept {
     s.swapchain.Reset();
     s.swap_rtv_heap.Reset();
     s.present_pipeline.Reset();
+    for (auto &pipeline : s.bloom_pipelines) pipeline.Reset();
+    for (auto &target : s.bloom_targets) target = {};
+    s.bloom_ready = false;
+    s.bloom_failed = false;
     s.present_pixel_shader.Reset();
     s.present_vertex_shader.Reset();
     s.pipelines.clear();
@@ -3068,8 +3409,8 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             active_scissor = scissor;
             active_scissor_valid = true;
         }
-        if (blend_variant(batch.draw) == 4u) {
-            const std::uint32_t fix = batch.draw.blend_fix_source & 0x00FFFFFFu;
+        if (const ResolvedBlend blend = resolve_blend(batch.draw); blend.uses_factor) {
+            const std::uint32_t fix = blend.factor;
             if (fix != active_blend_fix) {
                 const float factors[4]{
                     static_cast<float>(fix & 0xFFu) / 255.0f,
@@ -3090,11 +3431,21 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         if (batch.draw.depth_test_enabled) s.report.depth_tested_game_draw_calls += batch.logical_draw_count;
         if (batch.draw.depth_write_enabled) s.report.depth_writing_game_draw_calls += batch.logical_draw_count;
         if (batch.draw.alpha_test_enabled) s.report.alpha_tested_game_draw_calls += batch.logical_draw_count;
-        switch (blend_variant(batch.draw)) {
-        case 1u: s.report.standard_alpha_blended_game_draw_calls += batch.logical_draw_count; break;
-        case 2u: s.report.fixed_replace_blended_game_draw_calls += batch.logical_draw_count; break;
-        case 3u: s.report.additive_blended_game_draw_calls += batch.logical_draw_count; break;
-        default: break;
+        {
+            const ResolvedBlend blend = resolve_blend(batch.draw);
+            if (batch.draw.blend_enabled && !batch.draw.clear_mode) record_blend_usage(batch.draw, blend);
+            if (!blend.enabled) {
+                if (batch.draw.blend_enabled && !batch.draw.clear_mode)
+                    s.report.fixed_replace_blended_game_draw_calls += batch.logical_draw_count;
+            } else if (blend.approximated) {
+                s.report.unsupported_blend_game_draw_calls += batch.logical_draw_count;
+            } else if (blend.op == D3D12_BLEND_OP_ADD && blend.src == D3D12_BLEND_SRC_ALPHA &&
+                       blend.dst == D3D12_BLEND_INV_SRC_ALPHA) {
+                s.report.standard_alpha_blended_game_draw_calls += batch.logical_draw_count;
+            } else if (blend.op == D3D12_BLEND_OP_ADD && blend.src == D3D12_BLEND_ONE &&
+                       blend.dst == D3D12_BLEND_ONE) {
+                s.report.additive_blended_game_draw_calls += batch.logical_draw_count;
+            }
         }
         if (batch.draw.fog_enabled) s.report.fogged_game_draw_calls += batch.logical_draw_count;
         if (srv_index != 0u) {
@@ -3278,6 +3629,24 @@ bool ge_gpu_backend_copy_offscreen_rgba(std::span<std::byte> destination) noexce
 }
 void ge_gpu_backend_mark_window_presented() noexcept { state().report.gpu_frame_presented_to_window = true; }
 GeGpuBackendReport ge_gpu_backend_report() { return state().report; }
+void ge_gpu_backend_print_blend_usage() {
+    const std::lock_guard<std::mutex> guard(g_blend_usage_mutex);
+    if (g_blend_usage.empty()) return;
+    static const char *const kEquations[] = {"add", "sub", "rsub", "min", "max", "abs"};
+    static const char *const kSource[] = {"dstC", "1-dstC", "srcA", "1-srcA", "dstA", "1-dstA",
+                                          "2srcA", "1-2srcA", "2dstA", "1-2dstA", "fix"};
+    static const char *const kDest[] = {"srcC", "1-srcC", "srcA", "1-srcA", "dstA", "1-dstA",
+                                        "2srcA", "1-2srcA", "2dstA", "1-2dstA", "fix"};
+    std::cerr << "[blend-usage] equation src dst fixSrc fixDst textured status count\n";
+    for (const auto &[key, count] : g_blend_usage) {
+        std::cerr << "[blend-usage] " << (key[0] < 6u ? kEquations[key[0]] : "?") << ' '
+                  << (key[1] < 11u ? kSource[key[1]] : "?") << ' '
+                  << (key[2] < 11u ? kDest[key[2]] : "?") << ' ' << std::hex << key[3] << ' '
+                  << key[4] << std::dec << ' ' << (key[5] != 0u ? "tex" : "flat") << ' '
+                  << (key[6] == 1u ? "APPROXIMATED" : (key[6] == 2u ? "replace" : "ok")) << ' '
+                  << count << '\n';
+    }
+}
 
 #else
 
@@ -3331,6 +3700,7 @@ std::span<const std::byte> ge_gpu_backend_game_frame_rgba() noexcept { return {}
 bool ge_gpu_backend_copy_offscreen_rgba(std::span<std::byte>) noexcept { return false; }
 void ge_gpu_backend_mark_window_presented() noexcept {}
 GeGpuBackendReport ge_gpu_backend_report() { return state().report; }
+void ge_gpu_backend_print_blend_usage() {}
 
 #endif
 

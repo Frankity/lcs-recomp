@@ -416,6 +416,8 @@ void ge_gpu_backend_display_logical_size(std::uint32_t &width, std::uint32_t &he
 void ge_gpu_backend_mark_window_presented() noexcept;
 
 [[nodiscard]] GeGpuBackendReport ge_gpu_backend_report();
+// Prints the distinct blend states the game used (only recorded when LCS_BLEND_DIAG is set).
+void ge_gpu_backend_print_blend_usage();
 [[nodiscard]] const char *ge_gpu_backend_name(GeGpuBackendKind kind) noexcept;
 
 }

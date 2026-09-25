@@ -104,6 +104,11 @@ struct HudScale {
 constexpr std::array<HudScale, 4> kHudScales{{
     {"25%", "0.25"}, {"50%", "0.5"}, {"75%", "0.75"}, {"100%", "1.0"}}};
 constexpr std::array<const char *, 3> kFilters{"BILINEAR", "NEAREST", "INTEGER"};
+struct BloomChoice {
+    const char *name;
+    const char *value;
+};
+constexpr std::array<BloomChoice, 3> kBloomModes{{{"OFF", "Off"}, {"LOW", "Low"}, {"HIGH", "High"}}};
 struct FpsSize {
     const char *name;
     float scale;
@@ -161,26 +166,29 @@ Option g_options[] = {
          return lcs_save_config_value("Timing", "FrameRate", std::to_string(kFrameRates[i]));
      },
      0u, 0u},
-    {"FEX_WID", "WIDESCREEN", 2u,
-     [](const Config &c) { return c.widescreen.enabled ? 1u : 0u; },
-     bool_text,
-     [](std::uint32_t i) { return lcs_save_config_value("Widescreen", "Enabled", bool_value(i)); },
-     0u, 0u},
-    {"FEX_ASP", "ASPECT RATIO", static_cast<std::uint32_t>(kAspects.size()),
+    {"FEX_WID", "WIDESCREEN", static_cast<std::uint32_t>(kAspects.size() + 1u),
      [](const Config &c) {
+         if (!c.widescreen.enabled) return 0u;
          for (std::uint32_t i = 1u; i < kAspects.size(); ++i)
-             if (c.widescreen.aspect_x * kAspects[i].y == kAspects[i].x * c.widescreen.aspect_y &&
-                 c.widescreen.aspect_x != 0u)
-                 return i;
-         return 0u;
+             if (c.widescreen.aspect_x != 0u &&
+                 c.widescreen.aspect_x * kAspects[i].y == kAspects[i].x * c.widescreen.aspect_y)
+                 return i + 1u;
+         return 1u;
      },
-     [](std::uint32_t i) { return std::string(kAspects[i].name); },
+     [](std::uint32_t i) { return i == 0u ? std::string("OFF") : std::string(kAspects[i - 1u].name); },
      [](std::uint32_t i) {
-         const Aspect &a = kAspects[i];
-         return lcs_save_config_value("Widescreen", "AspectRatio",
-                                      i == 0u ? std::string("auto")
+         if (i == 0u) return lcs_save_config_value("Widescreen", "Enabled", "false");
+         const Aspect &a = kAspects[i - 1u];
+         return lcs_save_config_value("Widescreen", "Enabled", "true") &&
+                lcs_save_config_value("Widescreen", "AspectRatio",
+                                      i == 1u ? std::string("auto")
                                               : std::to_string(a.x) + ":" + std::to_string(a.y));
      },
+     0u, 0u},
+    {"FEX_BLM", "BLOOM", static_cast<std::uint32_t>(kBloomModes.size()),
+     [](const Config &c) { return static_cast<std::uint32_t>(c.rendering.bloom); },
+     [](std::uint32_t i) { return std::string(kBloomModes[i].name); },
+     [](std::uint32_t i) { return lcs_save_config_value("Rendering", "Bloom", kBloomModes[i].value); },
      0u, 0u},
     {"FEX_UPS", "UPSCALE FILTER", static_cast<std::uint32_t>(kFilters.size()),
      [](const Config &c) {

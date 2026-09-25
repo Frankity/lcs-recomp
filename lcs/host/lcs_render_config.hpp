@@ -30,6 +30,12 @@ enum class InternalResolutionMode : std::uint8_t {
     Desktop,
 };
 
+enum class BloomMode : std::uint8_t {
+    Off,
+    Low,
+    High,
+};
+
 enum class RenderingBackend : std::uint8_t {
     Software,
     DirectX12,
@@ -88,6 +94,7 @@ struct RenderingConfiguration {
     bool hardware_transform{true};
     bool dx12_ge_color{true};
     bool smaa{false};
+    BloomMode bloom{BloomMode::Low};  // glow around bright lights, added when presenting
     bool experimental_gpu_color_preview{false};
     bool gpu_geometry_debug_colors{false};
     std::uint64_t dump_gpu_frame_vblank{0u};
@@ -163,6 +170,7 @@ void initialize_lcs_render_configuration(const std::filesystem::path &executable
 [[nodiscard]] const char *display_upscale_filter_name(DisplayUpscaleFilter filter) noexcept;
 [[nodiscard]] const char *internal_resolution_mode_name(InternalResolutionMode mode) noexcept;
 [[nodiscard]] const char *rendering_backend_name(RenderingBackend backend) noexcept;
+[[nodiscard]] const char *bloom_mode_name(BloomMode mode) noexcept;
 
 [[nodiscard]] float resolve_widescreen_aspect_ratio(
     const LcsConfiguration &configuration,

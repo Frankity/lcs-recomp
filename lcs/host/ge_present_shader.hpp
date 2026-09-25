@@ -31,6 +31,40 @@ float4 PresentPS(PresentVertexOutput i) : SV_TARGET {
             sum += PresentTexture0.SampleLevel(PresentSampler, origin + tap_step * float2(x, y), 0.0);
     return sum / float(taps.x * taps.y);
 }
+cbuffer BloomConstants : register(b1) {
+    float4 BloomTexel;   // xy: texel size of the source, zw: blur direction
+    float4 BloomParams;  // x: brightness threshold, y: gain
+};
+float3 BloomBrightFilter(float3 c) {
+    float peak = max(c.r, max(c.g, c.b));
+    float knee = saturate((peak - BloomParams.x) / max(1.0 - BloomParams.x, 1.0e-4));
+    return c * (knee * knee * (3.0 - 2.0 * knee));
+}
+float3 BloomTap(float2 uv) { return PresentTexture0.SampleLevel(PresentSampler, uv, 0.0).rgb; }
+float4 BloomBrightPS(PresentVertexOutput i) : SV_TARGET {
+    float3 sum = 0.0;
+    [unroll] for (int y = -1; y <= 1; y += 2)
+        [unroll] for (int x = -1; x <= 1; x += 2)
+            sum += BloomBrightFilter(BloomTap(i.uv + float2(x, y) * BloomTexel.xy));
+    return float4(sum * 0.25, 1.0);
+}
+float4 BloomDownPS(PresentVertexOutput i) : SV_TARGET {
+    float3 sum = 0.0;
+    [unroll] for (int y = -1; y <= 1; y += 2)
+        [unroll] for (int x = -1; x <= 1; x += 2)
+            sum += BloomTap(i.uv + float2(x, y) * BloomTexel.xy);
+    return float4(sum * 0.25, 1.0);
+}
+float4 BloomBlurPS(PresentVertexOutput i) : SV_TARGET {
+    float2 step = BloomTexel.zw * BloomTexel.xy;
+    float3 sum = BloomTap(i.uv) * 0.2270270270;
+    sum += (BloomTap(i.uv + step * 1.3846153846) + BloomTap(i.uv - step * 1.3846153846)) * 0.3162162162;
+    sum += (BloomTap(i.uv + step * 3.2307692308) + BloomTap(i.uv - step * 3.2307692308)) * 0.0702702703;
+    return float4(sum, 1.0);
+}
+float4 BloomAddPS(PresentVertexOutput i) : SV_TARGET {
+    return float4(BloomTap(i.uv) * BloomParams.y, 0.0);
+}
 )PRESENT_HLSL";
 
 }

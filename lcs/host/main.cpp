@@ -124,6 +124,7 @@ int main(int argc, char **argv) {
         }
         runtime.report_hle_histogram(60u);
         const lcs::GeGpuBackendReport gpu_end = lcs::ge_gpu_backend_report();
+        lcs::ge_gpu_backend_print_blend_usage();
         std::cerr << "[ge-gpu] frames=" << gpu_end.game_frames
                   << " draws=" << gpu_end.game_draw_calls
                   << " tris=" << gpu_end.game_triangles
