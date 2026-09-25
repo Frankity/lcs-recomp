@@ -1,0 +1,29 @@
+# Game data (copyrighted, supplied by the user) and local notes
+/lcs/game/
+/lcs/analysis/
+/lcs/progress/
+/lcs/generated/
+# Build output
+/out/
+/build/
+/cmake-build-*/
+CMakeUserPresets.json
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.exe
+
+# Runtime output written next to the executable or the working directory
+*.log
+ram_vblank_*.bin
+
+# Editors, IDEs and local tool settings
+.vs/
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
