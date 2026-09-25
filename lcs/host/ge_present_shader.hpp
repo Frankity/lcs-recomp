@@ -36,6 +36,14 @@ float4 PresentBase(float2 uv) {
             sum += PresentTexture0.SampleLevel(PresentSampler, origin + tap_step * float2(x, y), 0.0);
     return sum / float(taps.x * taps.y);
 }
+// Identity up to 1.0. Overbright colours are scaled back into range keeping their hue, and roll
+// towards white the further over they are, instead of clipping channel by channel.
+float3 PresentTonemap(float3 c) {
+    float m = max(c.r, max(c.g, c.b));
+    float over = saturate((m - 1.0) * 0.5);
+    float3 hue = c / max(m, 1.0);
+    return lerp(hue, hue + (1.0 - hue) * 0.5, over);
+}
 float3 PresentTap(float2 uv) { return PresentTexture0.SampleLevel(PresentSampler, uv, 0.0).rgb; }
 float PresentLuma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 // FXAA 1.0 (edge direction blur along the local luma gradient) on the four diagonal neighbours.
@@ -67,6 +75,7 @@ float3 PresentFxaa(float2 uv, float3 rgbM) {
 }
 float4 PresentPS(PresentVertexOutput i) : SV_TARGET {
     float4 base = PresentBase(i.uv);
+    base.rgb = PresentTonemap(base.rgb);
     if (PostB.z > 0.5 && i.uv.x < 0.5) return base;  // debug split: the left half stays untouched
     float3 c = base.rgb;
     if (PostB.y > 0.5) c = PresentFxaa(i.uv, c);
@@ -96,7 +105,8 @@ float4 PresentPS(PresentVertexOutput i) : SV_TARGET {
 float3 BloomBrightFilter(float3 c) {
     float peak = max(c.r, max(c.g, c.b));
     float knee = saturate((peak - BloomParams.x) / max(1.0 - BloomParams.x, 1.0e-4));
-    return c * (knee * knee * (3.0 - 2.0 * knee));
+    float overbright = 1.0 + max(peak - 1.0, 0.0);  // only above 1.0 with the HDR targets
+    return c * (knee * knee * (3.0 - 2.0 * knee)) * overbright;
 }
 float3 BloomTap(float2 uv) { return PresentTexture0.SampleLevel(PresentSampler, uv, 0.0).rgb; }
 float4 BloomBrightPS(PresentVertexOutput i) : SV_TARGET {

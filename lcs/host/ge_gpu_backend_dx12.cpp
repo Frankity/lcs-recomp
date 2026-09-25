@@ -48,6 +48,13 @@ constexpr std::size_t kGeometryUploadCapacity = 64u * 1024u * 1024u;
 constexpr std::size_t kTextureUploadCapacity = 32u * 1024u * 1024u;
 constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr DXGI_FORMAT kBloomFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+// Format of the game's colour targets. With Rendering.HDR they are 16-bit float, so overbright
+// values (scaled lighting, stacked additive coronas, double colour textures) survive until the
+// present pass tone-maps them. Game textures and the swap chain stay 8-bit.
+DXGI_FORMAT scene_format() noexcept {
+    return lcs_render_configuration().rendering.hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+}
 constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT;
 constexpr UINT kFrameCount = 2u;
 constexpr UINT kSrvCapacity = 65536u;
@@ -488,7 +495,7 @@ void resolve_target_for_sampling(Dx12GeState &s, Dx12FramebufferTarget &target,
                    D3D12_RESOURCE_STATE_RESOLVE_DEST);
         target.color_state = D3D12_RESOURCE_STATE_RESOLVE_DEST;
         s.list->ResolveSubresource(target.color.Get(), 0u, target.msaa_color.Get(), 0u,
-                                   kColorFormat);
+                                   scene_format());
         ++s.report.dx12_resolves;
         transition(s.list.Get(), target.color.Get(), target.color_state,
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -607,7 +614,7 @@ void select_depth_and_msaa(Dx12GeState &s) noexcept {
     s.sample_quality = 0u;
     for (UINT samples = requested; samples >= 2u; samples >>= 1u) {
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS color{};
-        color.Format = kColorFormat;
+        color.Format = scene_format();
         color.SampleCount = samples;
         color.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS depth{};
@@ -878,6 +885,17 @@ bool append_or_merge_batch(Dx12GeState &s, Dx12Batch batch) {
 
 bool compile_shaders(Dx12GeState &s, std::string &error) noexcept {
     const char *shader = R"HLSL(
+#ifndef LCS_HDR
+#define LCS_HDR 0
+#endif
+// Colours are clamped to 0-1 like the PSP does; with LCS_HDR only the negative side and alpha are.
+float4 LcsColorClamp(float4 v) {
+#if LCS_HDR
+    return float4(max(v.rgb, 0.0), saturate(v.a));
+#else
+    return saturate(v);
+#endif
+}
 Texture2D<float4> SourceTexture : register(t0);
 SamplerState SourceSampler : register(s0);
 cbuffer DrawTransform : register(b0) {
@@ -952,7 +970,7 @@ VSOut VSMain(VSIn input) {
     }
     o.color = input.color;
     if (TransformControl.z != 0u) {
-        float4 lit = saturate(o.color * VertexColorMul + VertexColorAdd);
+        float4 lit = LcsColorClamp(o.color * VertexColorMul + VertexColorAdd);
         o.color = floor(lit * 255.0) * (1.0 / 255.0);
     }
     o.q = input.q;
@@ -994,7 +1012,7 @@ VSOut VSMainPacked0115(VSInPacked0115 input) {
         (packed & 0x8000u) != 0u ? 1.0 : 0.0);
     if (TransformControl.z != 0u) {
         // Match the CPU path's per-channel RGBA8 clamp/truncation boundary.
-        float4 lit = saturate(o.color * VertexColorMul + VertexColorAdd);
+        float4 lit = LcsColorClamp(o.color * VertexColorMul + VertexColorAdd);
         o.color = floor(lit * 255.0) * (1.0 / 255.0);
     }
     o.q = 1.0;
@@ -1037,13 +1055,14 @@ float4 ApplyTextureFunction(float4 vertex, float4 textureValue, uint4 control, u
         outColor.rgb = saturate(vertex.rgb + textureValue.rgb);
         outColor.a = useAlpha ? vertex.a * textureValue.a : vertex.a;
     }
-    if (doubleColor) outColor.rgb = saturate(outColor.rgb * 2.0);
+    if (doubleColor) outColor.rgb = LcsColorClamp(float4(outColor.rgb * 2.0, 1.0)).rgb;
     return outColor;
 }
 float Quantize(float value, float levels) {
     return floor(saturate(value) * levels + 0.5) / levels;
 }
 float4 QuantizeFramebuffer(float4 color, uint format) {
+    float4 unclamped = LcsColorClamp(color);  // kept for the 8888 format when LCS_HDR is set
     color = saturate(color);
     if ((format & 3u) == 0u) { // PSP GU_PSM_5650
         color.r = Quantize(color.r, 31.0);
@@ -1057,6 +1076,9 @@ float4 QuantizeFramebuffer(float4 color, uint format) {
         color = float4(Quantize(color.r,15.0), Quantize(color.g,15.0),
                        Quantize(color.b,15.0), Quantize(color.a,15.0));
     }
+#if LCS_HDR
+    if ((format & 3u) == 3u) color = unclamped;
+#endif
     return color;
 }
 float4 PSMain(VSOut input) : SV_TARGET {
@@ -1071,7 +1093,7 @@ float4 PSMain(VSOut input) : SV_TARGET {
     const uint4 alphaControl = uint4(AlphaControlPacked & 0xFFu,
         (AlphaControlPacked >> 8u) & 0xFFu, (AlphaControlPacked >> 16u) & 0xFFu,
         (AlphaControlPacked >> 24u) & 0xFFu);
-    float4 color = saturate(input.color);
+    float4 color = LcsColorClamp(input.color);
     if (textureControl.w != 0u) {
         float q = abs(input.q) < 1.0e-20 ? 1.0 : input.q;
         float2 uv = input.uv / q;
@@ -1091,8 +1113,10 @@ float4 PSMain(VSOut input) : SV_TARGET {
 }
 )HLSL";
     UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_WARNINGS_ARE_ERRORS;
+    const D3D_SHADER_MACRO defines[] = {
+        {"LCS_HDR", lcs_render_configuration().rendering.hdr ? "1" : "0"}, {nullptr, nullptr}};
     ComPtr<ID3DBlob> errors;
-    HRESULT hr = D3DCompile(shader, std::strlen(shader), "LCSNativeDX12GE", nullptr, nullptr,
+    HRESULT hr = D3DCompile(shader, std::strlen(shader), "LCSNativeDX12GE", defines, nullptr,
                             "VSMain", "vs_5_1", flags, 0u, &s.vertex_shader, &errors);
     if (FAILED(hr)) {
         error = errors ? std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize())
@@ -1100,7 +1124,7 @@ float4 PSMain(VSOut input) : SV_TARGET {
         return false;
     }
     errors.Reset();
-    hr = D3DCompile(shader, std::strlen(shader), "LCSNativeDX12GE", nullptr, nullptr,
+    hr = D3DCompile(shader, std::strlen(shader), "LCSNativeDX12GE", defines, nullptr,
                     "VSMainPacked0115", "vs_5_1", flags, 0u,
                     &s.packed_0115_vertex_shader, &errors);
     if (FAILED(hr)) {
@@ -1109,7 +1133,7 @@ float4 PSMain(VSOut input) : SV_TARGET {
         return false;
     }
     errors.Reset();
-    hr = D3DCompile(shader, std::strlen(shader), "LCSNativeDX12GE", nullptr, nullptr,
+    hr = D3DCompile(shader, std::strlen(shader), "LCSNativeDX12GE", defines, nullptr,
                     "PSMain", "ps_5_1", flags, 0u, &s.pixel_shader, &errors);
     if (FAILED(hr)) {
         error = errors ? std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize())
@@ -1327,14 +1351,14 @@ bool ensure_framebuffer_target(Dx12GeState &s, std::uint32_t address,
     color.Height = s.target_height;
     color.DepthOrArraySize = 1u;
     color.MipLevels = 1u;
-    color.Format = kColorFormat;
+    color.Format = scene_format();
     color.SampleDesc.Count = 1u;
     color.SampleDesc.Quality = 0u;
     color.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     color.Flags = s.sample_count == 1u ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
                                        : D3D12_RESOURCE_FLAG_NONE;
     D3D12_CLEAR_VALUE color_clear{};
-    color_clear.Format = kColorFormat;
+    color_clear.Format = scene_format();
     color_clear.Color[3] = 1.0f;
     HRESULT hr = s.device->CreateCommittedResource(
         &default_heap, D3D12_HEAP_FLAG_NONE, &color,
@@ -1360,7 +1384,7 @@ bool ensure_framebuffer_target(Dx12GeState &s, std::uint32_t address,
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Format = kColorFormat;
+    srv.Format = scene_format();
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Texture2D.MipLevels = 1u;
     s.device->CreateShaderResourceView(target.color.Get(), &srv, srv_cpu(s, target.srv_index));
@@ -1422,7 +1446,7 @@ bool ensure_feedback_copy(Dx12GeState &s, Dx12FramebufferTarget &target,
     color.Height = s.target_height;
     color.DepthOrArraySize = 1u;
     color.MipLevels = 1u;
-    color.Format = kColorFormat;
+    color.Format = scene_format();
     color.SampleDesc.Count = 1u;
     color.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     color.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -1433,7 +1457,7 @@ bool ensure_feedback_copy(Dx12GeState &s, Dx12FramebufferTarget &target,
     target.feedback_srv_index = s.next_srv++;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Format = kColorFormat;
+    srv.Format = scene_format();
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Texture2D.MipLevels = 1u;
     s.device->CreateShaderResourceView(target.feedback_copy.Get(), &srv,
@@ -1516,7 +1540,7 @@ ComPtr<ID3D12PipelineState> create_pipeline(Dx12GeState &s,
     pso.DepthStencilState.StencilEnable = FALSE;
     pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pso.NumRenderTargets = 1u;
-    pso.RTVFormats[0] = kColorFormat;
+    pso.RTVFormats[0] = scene_format();
     pso.DSVFormat = s.depth_format;
     pso.SampleDesc.Count = s.sample_count;
     pso.SampleDesc.Quality = s.sample_quality;
@@ -2375,7 +2399,8 @@ bool create_backend(Dx12GeState &s, std::string &error) noexcept {
     s.target_width = std::max<std::uint32_t>(1u, dims.width);
     s.target_height = std::max<std::uint32_t>(1u, dims.height);
     const char *readback = std::getenv("PSPRECOMP_DX12_GE_READBACK");
-    s.readback_enabled = readback == nullptr || (*readback != '\0' && *readback != '0');
+    s.readback_enabled = (readback == nullptr || (*readback != '\0' && *readback != '0')) &&
+                         !lcs_render_configuration().rendering.hdr;  // the readback path is 8-bit only
     if (const char *ring = std::getenv("PSPRECOMP_DX12_TEXTURE_UPLOAD_RING");
         ring != nullptr && *ring != '\0') {
         s.texture_upload_ring_enabled = *ring != '0' &&

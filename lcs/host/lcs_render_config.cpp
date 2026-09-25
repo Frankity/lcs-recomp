@@ -249,6 +249,11 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.DirectionalLight must be between 0.5 and 2");
         return;
     }
+    if (key == "hdr") {
+        if (!parse_bool(value, config.rendering.hdr))
+            warning(config, line, "Rendering.HDR expects true/false");
+        return;
+    }
     if (key == "fxaa") {
         if (!parse_bool(value, config.rendering.fxaa))
             warning(config, line, "Rendering.FXAA expects true/false");
