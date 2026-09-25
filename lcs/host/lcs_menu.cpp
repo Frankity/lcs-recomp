@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace lcs {
 namespace {
@@ -28,6 +29,11 @@ constexpr std::uint32_t kMenuScreenField = 1380u;
 constexpr std::uint32_t kMenuItemField = 1384u;
 
 constexpr std::uint32_t kDisplayScreen = 5u;
+// Second page of graphics settings. Screens 15 and up are blank multiplayer sub-pages: the game's
+// per-screen tables treat them as sub-pages, and the tab bar keeps showing the Display tab.
+constexpr std::uint32_t kGraphicsScreen = 15u;
+constexpr std::uint16_t kLinkAction = 3u;  // "go to the screen named by the item's target byte"
+constexpr std::uint32_t kItemTargetField = 11u;
 constexpr std::uint32_t kHudItem = 3u;
 constexpr std::uint32_t kFirstOptionItem = 4u;
 constexpr std::uint16_t kOptionAction = 41u;
@@ -75,12 +81,22 @@ constexpr char kQuitTabKey[] = "FEX_QIT";
 constexpr char kQuitQuestionKey[] = "FEX_QQ";
 constexpr char kYesKey[] = "FEU_YES";
 constexpr char kKeyPrefix[] = "FEX_";
+constexpr char kMoreKey[] = "FEX_MOR";
+constexpr char kBackKey[] = "FEX_BAK";
+constexpr char kGraphicsTitleKey[] = "FEX_GFX";
 
 // ms_lodDistScale: a 1.0f in the EBOOT that the camera update multiplies its LOD distance factor by.
 constexpr std::uint32_t kLodDistScaleAddress = 0x08B56790u;
 constexpr std::uint32_t kOneAsFloat = 0x3F800000u;
 
 using Config = LcsConfiguration;
+
+// A row whose choices are plain numbers: the value shown, the number, and the text written to the ini.
+struct FloatChoice {
+    const char *name;
+    float value;
+    const char *text;
+};
 
 struct Option {
     const char *key;    // 7 characters, stored in the item and looked up as a text key
@@ -93,6 +109,13 @@ struct Option {
     std::uint32_t pending_index;
     // Optional: applies the choice to the running game right away (no restart needed).
     void (*apply)(psprecomp::GuestMemory &memory, std::uint32_t index){};
+    std::uint32_t page{};  // 0 = Display, 1 = the graphics page
+    // Rows made of FloatChoice values fill the four callbacks above from these.
+    const FloatChoice *choices{};
+    const char *section{};
+    const char *ini_key{};
+    float (*config_value)(const Config &){};
+    void (*set_live)(float){};
 };
 
 constexpr std::array<std::uint32_t, 5> kFrameRates{30u, 60u, 120u, 200u, 240u};
@@ -126,6 +149,23 @@ struct DrawDistanceChoice {
 };
 constexpr std::array<DrawDistanceChoice, 5> kDrawDistanceChoices{{
     {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"1.5X", 1.5f, "1.5"}, {"2X", 2.0f, "2.0"}, {"3X", 3.0f, "3.0"}}};
+constexpr std::array<FloatChoice, 6> kFogChoices{{
+    {"OFF", 0.0f, "Off"}, {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"2X", 2.0f, "2.0"},
+    {"3X", 3.0f, "3.0"}, {"4X", 4.0f, "4.0"}}};
+constexpr std::array<FloatChoice, 5> kSharpnessChoices{{
+    {"OFF", 0.0f, "0.0"}, {"25%", 0.25f, "0.25"}, {"50%", 0.5f, "0.5"}, {"75%", 0.75f, "0.75"},
+    {"100%", 1.0f, "1.0"}}};
+constexpr std::array<FloatChoice, 6> kContrastChoices{{
+    {"80%", 0.8f, "0.8"}, {"90%", 0.9f, "0.9"}, {"100%", 1.0f, "1.0"}, {"110%", 1.1f, "1.1"},
+    {"120%", 1.2f, "1.2"}, {"130%", 1.3f, "1.3"}}};
+constexpr std::array<FloatChoice, 6> kSaturationChoices{{
+    {"0%", 0.0f, "0.0"}, {"50%", 0.5f, "0.5"}, {"75%", 0.75f, "0.75"}, {"100%", 1.0f, "1.0"},
+    {"125%", 1.25f, "1.25"}, {"150%", 1.5f, "1.5"}}};
+constexpr std::array<FloatChoice, 6> kGammaChoices{{
+    {"0.8", 0.8f, "0.8"}, {"0.9", 0.9f, "0.9"}, {"1.0", 1.0f, "1.0"}, {"1.1", 1.1f, "1.1"},
+    {"1.2", 1.2f, "1.2"}, {"1.3", 1.3f, "1.3"}}};
+constexpr std::array<FloatChoice, 4> kVignetteChoices{{
+    {"OFF", 0.0f, "0.0"}, {"25%", 0.25f, "0.25"}, {"50%", 0.5f, "0.5"}, {"75%", 0.75f, "0.75"}}};
 struct BloomChoice {
     const char *name;
     const char *value;
@@ -203,11 +243,6 @@ Option g_options[] = {
                                               : std::to_string(a.x) + ":" + std::to_string(a.y));
      },
      0u, 0u},
-    {"FEX_BLM", "BLOOM", static_cast<std::uint32_t>(kBloomModes.size()),
-     [](const Config &c) { return static_cast<std::uint32_t>(c.rendering.bloom); },
-     [](std::uint32_t i) { return std::string(kBloomModes[i].name); },
-     [](std::uint32_t i) { return lcs_save_config_value("Rendering", "Bloom", kBloomModes[i].value); },
-     0u, 0u},
     {"FEX_LOD", "LOD DISTANCE", static_cast<std::uint32_t>(kLodChoices.size()),
      [](const Config &c) {
          std::uint32_t best = 0u;
@@ -269,6 +304,35 @@ Option g_options[] = {
                                       std::to_string(kPowersOfTwo[i]));
      },
      0u, 0u},
+    {"FEX_BLM", "BLOOM", static_cast<std::uint32_t>(kBloomModes.size()),
+     [](const Config &c) { return static_cast<std::uint32_t>(c.rendering.bloom); },
+     [](std::uint32_t i) { return std::string(kBloomModes[i].name); },
+     [](std::uint32_t i) { return lcs_save_config_value("Rendering", "Bloom", kBloomModes[i].value); },
+     0u, 0u, nullptr, 1u},
+    {"FEX_FOG", "FOG DISTANCE", static_cast<std::uint32_t>(kFogChoices.size()), nullptr, nullptr, nullptr,
+     0u, 0u, nullptr, 1u, kFogChoices.data(), "Rendering", "FogDistance",
+     [](const Config &c) { return c.rendering.fog_distance; },
+     [](float v) { lcs_set_fog_distance_scale(v); }},
+    {"FEX_SHP", "SHARPNESS", static_cast<std::uint32_t>(kSharpnessChoices.size()), nullptr, nullptr, nullptr,
+     0u, 0u, nullptr, 1u, kSharpnessChoices.data(), "Rendering", "Sharpness",
+     [](const Config &c) { return c.rendering.sharpness; },
+     [](float v) { lcs_post_settings().sharpness.store(v); }},
+    {"FEX_CON", "CONTRAST", static_cast<std::uint32_t>(kContrastChoices.size()), nullptr, nullptr, nullptr,
+     0u, 0u, nullptr, 1u, kContrastChoices.data(), "Rendering", "Contrast",
+     [](const Config &c) { return c.rendering.contrast; },
+     [](float v) { lcs_post_settings().contrast.store(v); }},
+    {"FEX_SAT", "SATURATION", static_cast<std::uint32_t>(kSaturationChoices.size()), nullptr, nullptr, nullptr,
+     0u, 0u, nullptr, 1u, kSaturationChoices.data(), "Rendering", "Saturation",
+     [](const Config &c) { return c.rendering.saturation; },
+     [](float v) { lcs_post_settings().saturation.store(v); }},
+    {"FEX_GAM", "GAMMA", static_cast<std::uint32_t>(kGammaChoices.size()), nullptr, nullptr, nullptr,
+     0u, 0u, nullptr, 1u, kGammaChoices.data(), "Rendering", "Gamma",
+     [](const Config &c) { return c.rendering.gamma; },
+     [](float v) { lcs_post_settings().gamma.store(v); }},
+    {"FEX_VIG", "VIGNETTE", static_cast<std::uint32_t>(kVignetteChoices.size()), nullptr, nullptr, nullptr,
+     0u, 0u, nullptr, 1u, kVignetteChoices.data(), "Rendering", "Vignette",
+     [](const Config &c) { return c.rendering.vignette; },
+     [](float v) { lcs_post_settings().vignette.store(v); }},
     {"FEX_HSC", "HUD SCALE", static_cast<std::uint32_t>(kHudScales.size()),
      [](const Config &c) {
          std::uint32_t best = 0u;
@@ -280,7 +344,7 @@ Option g_options[] = {
      },
      [](std::uint32_t i) { return std::string(kHudScales[i].percent); },
      [](std::uint32_t i) { return lcs_save_config_value("Display", "HudScale", kHudScales[i].value); },
-     0u, 0u},
+     0u, 0u, nullptr, 1u},
     {"FEX_FPC", "FPS COUNTER", static_cast<std::uint32_t>(kFpsSizes.size() + 1u),
      [](const Config &c) {
          if (!c.display.show_fps) return 0u;
@@ -297,15 +361,28 @@ Option g_options[] = {
          return lcs_save_config_value("Display", "ShowFPS", "true") &&
                 lcs_save_config_value("Display", "FpsScale", kFpsSizes[i - 1u].value);
      },
-     0u, 0u},
+     0u, 0u, nullptr, 1u},
 };
-constexpr std::uint32_t kOptionCount = sizeof(g_options) / sizeof(g_options[0]);
-static_assert(kFirstOptionItem + kOptionCount <= 15u, "a screen holds 15 items");
-
 std::uint32_t g_scratch{};
 std::uint32_t g_menu{};
-std::uint32_t g_scroll{};
 std::uint32_t g_tab_table{};
+
+// One page of rows: the game's own rows (Display only), then the options placed on it, then a link
+// row (MORE GRAPHICS on Display, BACK on the graphics page).
+struct Page {
+    std::uint32_t screen;
+    std::uint32_t first_option_item;
+    std::vector<Option *> options;
+    std::uint32_t scroll;
+    std::uint32_t rows() const { return first_option_item + static_cast<std::uint32_t>(options.size()) + 1u; }
+};
+std::array<Page, 2> g_pages{{{kDisplayScreen, kFirstOptionItem, {}, 0u}, {kGraphicsScreen, 0u, {}, 0u}}};
+
+Page *page_for(std::uint32_t screen) noexcept {
+    for (Page &page : g_pages)
+        if (page.screen == screen && !page.options.empty()) return &page;
+    return nullptr;
+}
 std::uint32_t g_previous_screen{};
 
 std::uint32_t item_base(std::uint32_t screen, std::uint32_t item) noexcept {
@@ -349,16 +426,61 @@ void write_wide(psprecomp::GuestMemory &memory, std::uint32_t address,
 // The option behind `item` of `screen`, or nullptr when it is one of the game's own rows.
 Option *option_at(psprecomp::GuestMemory &memory, std::uint32_t screen,
                   std::uint32_t item) noexcept {
-    if (g_scratch == 0u || screen != kDisplayScreen) return nullptr;
-    if (item < kFirstOptionItem || item >= kFirstOptionItem + kOptionCount) return nullptr;
+    if (g_scratch == 0u) return nullptr;
+    Page *page = page_for(screen);
+    if (page == nullptr || item < page->first_option_item) return nullptr;
+    const std::uint32_t index = item - page->first_option_item;
+    if (index >= page->options.size()) return nullptr;
     if (memory.load16(item_base(screen, item)) != kOptionAction) return nullptr;
-    return &g_options[item - kFirstOptionItem];
+    return page->options[index];
+}
+
+std::uint32_t option_active_index(const Option &option, const Config &config) noexcept {
+    if (option.choices == nullptr) return std::min(option.active(config), option.count - 1u);
+    const float wanted = option.config_value(config);
+    std::uint32_t best = 0u;
+    for (std::uint32_t i = 1u; i < option.count; ++i)
+        if (std::abs(option.choices[i].value - wanted) < std::abs(option.choices[best].value - wanted))
+            best = i;
+    return best;
+}
+
+std::string option_text(const Option &option, std::uint32_t index) {
+    return option.choices != nullptr ? std::string(option.choices[index].name) : option.text(index);
+}
+
+bool option_save(const Option &option, std::uint32_t index) {
+    if (option.choices == nullptr) return option.save(index);
+    return lcs_save_config_value(option.section, option.ini_key, option.choices[index].text);
+}
+
+// Applies the choice to the running game when the option supports that; returns true if it did.
+bool option_apply(const Option &option, psprecomp::GuestMemory &memory, std::uint32_t index) {
+    if (option.choices != nullptr && option.set_live != nullptr) {
+        option.set_live(option.choices[index].value);
+        return true;
+    }
+    if (option.apply != nullptr) {
+        option.apply(memory, index);
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
 
-static void install_display_options(psprecomp::GuestMemory &memory) {
-    // Only patch the exact table this was written against.
+// Writes one item: a copy of `templ` (position, alignment) with a new action, key and target.
+static void write_item(psprecomp::GuestMemory &memory, std::uint32_t slot, std::uint32_t templ,
+                       std::uint16_t action, const char *key, std::uint8_t target) {
+    for (std::uint32_t offset = 0u; offset < kItemStride; offset += 2u)
+        memory.store16(slot + offset, memory.load16(templ + offset));
+    memory.store16(slot, action);
+    write_key(memory, slot + 2u, key);
+    memory.store8(slot + kItemTargetField, target);
+}
+
+static void install_pages(psprecomp::GuestMemory &memory) {
+    // Only patch the exact tables this was written against.
     const std::uint32_t first = item_base(kDisplayScreen, 0u);
     const std::uint32_t hud = item_base(kDisplayScreen, kHudItem);
     const char expected[] = "FED_BRI";
@@ -368,43 +490,41 @@ static void install_display_options(psprecomp::GuestMemory &memory) {
             return;
         }
     }
-    // With every slot used, the game ends the list by reading the first two bytes of the next
-    // screen's name (the language page, unused here) as an empty action, so those are cleared.
-    const bool uses_last_slot = kFirstOptionItem + kOptionCount >= 15u;
-    bool free_slots = memory.load16(hud) != 0u;
-    for (std::uint32_t i = 0u; i < kOptionCount + (uses_last_slot ? 0u : 1u); ++i)
-        free_slots = free_slots && memory.load16(item_base(kDisplayScreen, kHudItem + 1u + i)) == 0u;
-    if (uses_last_slot) {
-        const std::uint32_t next = screen_base(kDisplayScreen + 1u);
-        const char language[] = "FEH_LAN";
-        for (std::uint32_t i = 0u; i < sizeof(language); ++i)
-            free_slots = free_slots && memory.load8(next + i) == static_cast<std::uint8_t>(language[i]);
+    for (Option &option : g_options) g_pages[option.page].options.push_back(&option);
+    bool free_slots = memory.load16(hud) != 0u && key_equals(memory, screen_base(kGraphicsScreen), "FEH_MP");
+    for (const Page &page : g_pages) {
+        if (page.rows() > 14u) free_slots = false;  // the last slot must stay empty
+        for (std::uint32_t item = page.first_option_item; item <= page.rows(); ++item)
+            free_slots = free_slots && item < 15u && memory.load16(item_base(page.screen, item)) == 0u;
     }
     if (!free_slots) {
+        for (Page &page : g_pages) page.options.clear();
         std::cerr << "[menu] Display screen layout differs; extra rows disabled\n";
         return;
     }
 
     const Config &config = lcs_render_configuration();
-    for (std::uint32_t n = 0u; n < kOptionCount; ++n) {
-        Option &option = g_options[n];
-        option.active_index = std::min(option.active(config), option.count - 1u);
-        option.pending_index = option.active_index;
-
-        const std::uint32_t slot = item_base(kDisplayScreen, kFirstOptionItem + n);
-        for (std::uint32_t offset = 0u; offset < kItemStride; offset += 2u)
-            memory.store16(slot + offset, memory.load16(hud + offset));
-        memory.store16(slot, kOptionAction);
-        for (std::uint32_t i = 0u; i < 8u; ++i)
-            memory.store8(slot + 2u + i, i < 7u ? static_cast<std::uint8_t>(option.key[i]) : 0u);
+    for (Page &page : g_pages) {
+        std::uint32_t item = page.first_option_item;
+        for (Option *option : page.options) {
+            option->active_index = option_active_index(*option, config);
+            option->pending_index = option->active_index;
+            write_item(memory, item_base(page.screen, item++), hud, kOptionAction, option->key, 0u);
+        }
+        // The link row: opens the other page (Display -> graphics, graphics -> Display).
+        const bool on_display = page.screen == kDisplayScreen;
+        write_item(memory, item_base(page.screen, item), hud, kLinkAction,
+                   on_display ? kMoreKey : kBackKey,
+                   static_cast<std::uint8_t>(on_display ? kGraphicsScreen : kDisplayScreen));
     }
-    for (std::uint32_t item = 0u; item < kFirstOptionItem + kOptionCount; ++item)
-        memory.store16(item_base(kDisplayScreen, item) + kYField,
-                       static_cast<std::uint16_t>(row_y(item, 0u)));
+    write_key(memory, screen_base(kGraphicsScreen), kGraphicsTitleKey);
+    for (const Page &page : g_pages)
+        for (std::uint32_t item = 0u; item < page.rows(); ++item)
+            memory.store16(item_base(page.screen, item) + kYField,
+                           static_cast<std::uint16_t>(row_y(item, 0u)));
 
     for (const ActionTable &table : kActionTables)
         memory.store32(table.base + 4u * (kOptionAction - table.bias), table.target);
-    if (uses_last_slot) memory.store16(screen_base(kDisplayScreen + 1u), 0u);
 }
 
 // Adds the QUIT tab: a copy of the tab table with a ninth entry, a QUIT page built on a blank
@@ -468,7 +588,7 @@ static void install_quit_tab(psprecomp::GuestMemory &memory, std::uint32_t scrat
 void lcs_menu_install(psprecomp::GuestMemory &memory, std::uint32_t scratch_address) {
     g_population_scale = lcs_render_configuration().rendering.draw_distance;
     g_scratch = scratch_address;
-    install_display_options(memory);
+    install_pages(memory);
     install_quit_tab(memory, scratch_address);
 }
 
@@ -478,6 +598,7 @@ bool lcs_menu_text_override(psprecomp::GuestMemory &memory, std::uint32_t key_ad
     for (std::uint32_t i = 0u; i + 1u < sizeof(kKeyPrefix); ++i)
         if (memory.load8(key_address + i) != static_cast<std::uint8_t>(kKeyPrefix[i])) return false;
     for (const Option &option : g_options) {
+        if (g_pages[option.page].options.empty()) continue;  // not installed
         bool match = true;
         for (std::uint32_t i = 4u; i < 8u && match; ++i)
             match = memory.load8(key_address + i) == (i < 7u ? static_cast<std::uint8_t>(option.key[i]) : 0u);
@@ -487,7 +608,8 @@ bool lcs_menu_text_override(psprecomp::GuestMemory &memory, std::uint32_t key_ad
         return true;
     }
     static constexpr struct { const char *key; const char *text; } kFixedTexts[] = {
-        {kQuitTabKey, "QUIT"}, {kQuitQuestionKey, "QUIT THE GAME?"}};
+        {kQuitTabKey, "QUIT"}, {kQuitQuestionKey, "QUIT THE GAME?"}, {kMoreKey, "MORE GRAPHICS"},
+        {kBackKey, "BACK"}, {kGraphicsTitleKey, "GRAPHICS"}};
     for (const auto &fixed : kFixedTexts) {
         if (!key_equals(memory, key_address, fixed.key)) continue;
         write_wide(memory, g_scratch + kLabelOffset, fixed.text);
@@ -504,7 +626,7 @@ std::uint32_t lcs_menu_value_text(psprecomp::GuestMemory &memory, std::uint32_t 
     if (option == nullptr) return game_text;
     g_menu = menu;
 
-    std::string text = option->text(option->pending_index);
+    std::string text = option_text(*option, option->pending_index);
     if (option->pending_index != option->active_index) text += " - RESTART";
     write_wide(memory, g_scratch + kValueOffset, text);
     return g_scratch + kValueOffset;
@@ -520,12 +642,10 @@ bool lcs_menu_option_step(psprecomp::GuestMemory &memory, std::uint32_t menu,
     const std::uint32_t count = option->count;
     option->pending_index = direction < 0 ? (option->pending_index + count - 1u) % count
                                           : (option->pending_index + 1u) % count;
-    if (!option->save(option->pending_index))
+    if (!option_save(*option, option->pending_index))
         std::cerr << "[menu] could not write " << option->label << " to the ini\n";
-    if (option->apply != nullptr) {
-        option->apply(memory, option->pending_index);
+    if (option_apply(*option, memory, option->pending_index))
         option->active_index = option->pending_index;  // already in effect: no restart needed
-    }
     return true;
 }
 
@@ -551,19 +671,20 @@ void lcs_menu_tick(psprecomp::GuestMemory &memory) noexcept {
     g_previous_screen = current_screen;
     if (entered_quit && g_tab_table != 0u)
         memory.store32(g_menu + kMenuItemField, 1u);  // start on YES, not on the question
-    if (current_screen != kDisplayScreen) return;
 
-    const std::uint32_t rows = kFirstOptionItem + kOptionCount;
+    Page *page = page_for(current_screen);
+    if (page == nullptr) return;
+    const std::uint32_t rows = page->rows();
     const std::uint32_t selected = std::min(memory.load32(g_menu + kMenuItemField), rows - 1u);
-    std::uint32_t scroll = g_scroll;
+    std::uint32_t scroll = page->scroll;
     if (selected < scroll) scroll = selected;
     if (selected >= scroll + kVisibleRows) scroll = selected + 1u - kVisibleRows;
-    scroll = std::min(scroll, rows - kVisibleRows);
-    if (scroll == g_scroll) return;
+    scroll = rows > kVisibleRows ? std::min(scroll, rows - kVisibleRows) : 0u;
+    if (scroll == page->scroll) return;
 
-    g_scroll = scroll;
+    page->scroll = scroll;
     for (std::uint32_t item = 0u; item < rows; ++item)
-        memory.store16(item_base(kDisplayScreen, item) + kYField,
+        memory.store16(item_base(page->screen, item) + kYField,
                        static_cast<std::uint16_t>(row_y(item, scroll)));
 }
 
