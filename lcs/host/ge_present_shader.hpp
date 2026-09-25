@@ -52,7 +52,7 @@ float3 PresentFxaa(float2 uv, float3 rgbM) {
     float lumaM = PresentLuma(rgbM);
     float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
     float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
-    if (lumaMax - lumaMin < max(0.0312, lumaMax * 0.125)) return rgbM;  // flat area
+    bool flat_area = (lumaMax - lumaMin) < max(0.0312, lumaMax * 0.125);
     float2 dir;
     dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
     dir.y = ((lumaNW + lumaSW) - (lumaNE + lumaSE));
@@ -62,7 +62,8 @@ float3 PresentFxaa(float2 uv, float3 rgbM) {
     float3 rgbA = 0.5 * (PresentTap(uv + dir * (1.0 / 3.0 - 0.5)) + PresentTap(uv + dir * (2.0 / 3.0 - 0.5)));
     float3 rgbB = rgbA * 0.5 + 0.25 * (PresentTap(uv + dir * -0.5) + PresentTap(uv + dir * 0.5));
     float lumaB = PresentLuma(rgbB);
-    return (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
+    float3 blurred = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
+    return flat_area ? rgbM : blurred;  // flat areas are left untouched
 }
 float4 PresentPS(PresentVertexOutput i) : SV_TARGET {
     float4 base = PresentBase(i.uv);
