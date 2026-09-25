@@ -239,6 +239,31 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.LodScale must be between 0.25 and 8");
         return;
     }
+    if (key == "sharpness" || key == "sharpen") {
+        if (!parse_float(value, 0.0f, 1.0f, config.rendering.sharpness))
+            warning(config, line, "Rendering.Sharpness must be between 0 and 1");
+        return;
+    }
+    if (key == "contrast") {
+        if (!parse_float(value, 0.5f, 1.5f, config.rendering.contrast))
+            warning(config, line, "Rendering.Contrast must be between 0.5 and 1.5");
+        return;
+    }
+    if (key == "saturation") {
+        if (!parse_float(value, 0.0f, 2.0f, config.rendering.saturation))
+            warning(config, line, "Rendering.Saturation must be between 0 and 2");
+        return;
+    }
+    if (key == "gamma") {
+        if (!parse_float(value, 0.6f, 1.6f, config.rendering.gamma))
+            warning(config, line, "Rendering.Gamma must be between 0.6 and 1.6");
+        return;
+    }
+    if (key == "vignette") {
+        if (!parse_float(value, 0.0f, 1.0f, config.rendering.vignette))
+            warning(config, line, "Rendering.Vignette must be between 0 and 1");
+        return;
+    }
     if (key == "fogdistance" || key == "fog") {
         const std::string mode = lowercase_copy(trim_copy(value));
         if (mode == "off" || mode == "none" || mode == "false" || mode == "0") {
@@ -782,6 +807,21 @@ const LcsConfiguration &lcs_render_configuration() {
 
 namespace {
 std::atomic<float> g_fog_distance_scale{-1.0f};  // negative until first read
+}
+
+PostProcessSettings &lcs_post_settings() noexcept {
+    static PostProcessSettings settings;
+    static const bool initialized = [] {
+        const RenderingConfiguration &rendering = global_configuration().rendering;
+        settings.sharpness.store(rendering.sharpness);
+        settings.contrast.store(rendering.contrast);
+        settings.saturation.store(rendering.saturation);
+        settings.gamma.store(rendering.gamma);
+        settings.vignette.store(rendering.vignette);
+        return true;
+    }();
+    (void)initialized;
+    return settings;
 }
 
 float lcs_fog_distance_scale() noexcept {

@@ -1983,9 +1983,15 @@ bool record_direct_present(Dx12GeState &s, Dx12FramebufferTarget &source,
     s.list->SetDescriptorHeaps(2u, heaps);
     s.list->SetGraphicsRootDescriptorTable(0u, srv_gpu(s, source.srv_index));
     s.list->SetGraphicsRootDescriptorTable(1u, sampler_gpu(s, present_sampler(s)));
-    struct ReservedPresentConstants { std::array<std::uint32_t, 16> zero{}; } reserved{};
-    std::array<std::uint32_t, 21> present_constants{};
-    std::memcpy(present_constants.data() + 5u, &reserved, sizeof(reserved));
+    // Post-processing constants (see PresentConstants in ge_present_shader.hpp): dwords 0-7 belong to
+    // the bloom passes, 8-11 are PostA, 12-15 are PostB.
+    static const bool post_split = std::getenv("LCS_POST_SPLIT") != nullptr;  // debug: right half only
+    const PostProcessSettings &post = lcs_post_settings();
+    const std::array<float, 16> present_constants{
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        post.sharpness.load(std::memory_order_relaxed), post.contrast.load(std::memory_order_relaxed),
+        post.saturation.load(std::memory_order_relaxed), post.gamma.load(std::memory_order_relaxed),
+        post.vignette.load(std::memory_order_relaxed), 0.0f, post_split ? 1.0f : 0.0f, 0.0f};
     s.list->SetGraphicsRoot32BitConstants(
         3u, static_cast<UINT>(present_constants.size()), present_constants.data(), 0u);
     s.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
