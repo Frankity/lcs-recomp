@@ -239,6 +239,11 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.LodScale must be between 0.25 and 8");
         return;
     }
+    if (key == "fxaa") {
+        if (!parse_bool(value, config.rendering.fxaa))
+            warning(config, line, "Rendering.FXAA expects true/false");
+        return;
+    }
     if (key == "sharpness" || key == "sharpen") {
         if (!parse_float(value, 0.0f, 1.0f, config.rendering.sharpness))
             warning(config, line, "Rendering.Sharpness must be between 0 and 1");
@@ -818,6 +823,7 @@ PostProcessSettings &lcs_post_settings() noexcept {
         settings.saturation.store(rendering.saturation);
         settings.gamma.store(rendering.gamma);
         settings.vignette.store(rendering.vignette);
+        settings.fxaa.store(rendering.fxaa);
         return true;
     }();
     (void)initialized;

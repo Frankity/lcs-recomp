@@ -19,7 +19,7 @@ cbuffer PresentConstants : register(b1) {
     float4 BloomTexel;   // bloom passes: xy texel size of the source, zw blur direction
     float4 BloomParams;  // bloom passes: x brightness threshold, y gain
     float4 PostA;        // present: x sharpness, y contrast, z saturation, w gamma
-    float4 PostB;        // present: x vignette, y unused, z debug split
+    float4 PostB;        // present: x vignette, y fxaa (0/1), z debug split
 };
 float4 PresentBase(float2 uv) {
     float width, height;
@@ -37,10 +37,38 @@ float4 PresentBase(float2 uv) {
     return sum / float(taps.x * taps.y);
 }
 float3 PresentTap(float2 uv) { return PresentTexture0.SampleLevel(PresentSampler, uv, 0.0).rgb; }
+float PresentLuma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+// FXAA 1.0 (edge direction blur along the local luma gradient) on the four diagonal neighbours.
+float3 PresentFxaa(float2 uv, float3 rgbM) {
+    float width, height;
+    PresentTexture0.GetDimensions(width, height);
+    float2 texel = 1.0 / float2(width, height);
+    float3 rgbNW = PresentTap(uv + float2(-1.0, -1.0) * texel);
+    float3 rgbNE = PresentTap(uv + float2(1.0, -1.0) * texel);
+    float3 rgbSW = PresentTap(uv + float2(-1.0, 1.0) * texel);
+    float3 rgbSE = PresentTap(uv + float2(1.0, 1.0) * texel);
+    float lumaNW = PresentLuma(rgbNW), lumaNE = PresentLuma(rgbNE);
+    float lumaSW = PresentLuma(rgbSW), lumaSE = PresentLuma(rgbSE);
+    float lumaM = PresentLuma(rgbM);
+    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+    if (lumaMax - lumaMin < max(0.0312, lumaMax * 0.125)) return rgbM;  // flat area
+    float2 dir;
+    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+    dir.y = ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * 0.125), 1.0 / 128.0);
+    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    dir = clamp(dir * rcpDirMin, -8.0, 8.0) * texel;
+    float3 rgbA = 0.5 * (PresentTap(uv + dir * (1.0 / 3.0 - 0.5)) + PresentTap(uv + dir * (2.0 / 3.0 - 0.5)));
+    float3 rgbB = rgbA * 0.5 + 0.25 * (PresentTap(uv + dir * -0.5) + PresentTap(uv + dir * 0.5));
+    float lumaB = PresentLuma(rgbB);
+    return (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
+}
 float4 PresentPS(PresentVertexOutput i) : SV_TARGET {
     float4 base = PresentBase(i.uv);
     if (PostB.z > 0.5 && i.uv.x < 0.5) return base;  // debug split: the left half stays untouched
     float3 c = base.rgb;
+    if (PostB.y > 0.5) c = PresentFxaa(i.uv, c);
     if (PostA.x > 0.001) {
         // contrast adaptive sharpening on the four direct neighbours
         float width, height;

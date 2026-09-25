@@ -1991,7 +1991,8 @@ bool record_direct_present(Dx12GeState &s, Dx12FramebufferTarget &source,
         0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
         post.sharpness.load(std::memory_order_relaxed), post.contrast.load(std::memory_order_relaxed),
         post.saturation.load(std::memory_order_relaxed), post.gamma.load(std::memory_order_relaxed),
-        post.vignette.load(std::memory_order_relaxed), 0.0f, post_split ? 1.0f : 0.0f, 0.0f};
+        post.vignette.load(std::memory_order_relaxed),
+        post.fxaa.load(std::memory_order_relaxed) ? 1.0f : 0.0f, post_split ? 1.0f : 0.0f, 0.0f};
     s.list->SetGraphicsRoot32BitConstants(
         3u, static_cast<UINT>(present_constants.size()), present_constants.data(), 0u);
     s.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

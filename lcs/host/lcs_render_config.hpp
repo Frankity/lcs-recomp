@@ -104,6 +104,7 @@ struct RenderingConfiguration {
     float saturation{1.0f};   // 1 = unchanged, 0 = greyscale
     float gamma{1.0f};        // 1 = unchanged, above 1 brightens the mid tones
     float vignette{0.0f};     // darkening towards the corners, 0 - 1
+    bool fxaa{false};         // fast approximate anti-aliasing of the presented image
     bool experimental_gpu_color_preview{false};
     bool gpu_geometry_debug_colors{false};
     std::uint64_t dump_gpu_frame_vblank{0u};
@@ -178,6 +179,7 @@ struct PostProcessSettings {
     std::atomic<float> saturation{1.0f};
     std::atomic<float> gamma{1.0f};
     std::atomic<float> vignette{0.0f};
+    std::atomic<bool> fxaa{false};
 };
 [[nodiscard]] PostProcessSettings &lcs_post_settings() noexcept;
 

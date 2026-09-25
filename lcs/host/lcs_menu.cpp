@@ -149,6 +149,7 @@ struct DrawDistanceChoice {
 };
 constexpr std::array<DrawDistanceChoice, 5> kDrawDistanceChoices{{
     {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"1.5X", 1.5f, "1.5"}, {"2X", 2.0f, "2.0"}, {"3X", 3.0f, "3.0"}}};
+constexpr std::array<FloatChoice, 2> kFxaaChoices{{{"OFF", 0.0f, "false"}, {"ON", 1.0f, "true"}}};
 constexpr std::array<FloatChoice, 6> kFogChoices{{
     {"OFF", 0.0f, "Off"}, {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"2X", 2.0f, "2.0"},
     {"3X", 3.0f, "3.0"}, {"4X", 4.0f, "4.0"}}};
@@ -309,6 +310,10 @@ Option g_options[] = {
      [](std::uint32_t i) { return std::string(kBloomModes[i].name); },
      [](std::uint32_t i) { return lcs_save_config_value("Rendering", "Bloom", kBloomModes[i].value); },
      0u, 0u, nullptr, 1u},
+    {"FEX_FXA", "FXAA", static_cast<std::uint32_t>(kFxaaChoices.size()), nullptr, nullptr, nullptr,
+     0u, 0u, nullptr, 1u, kFxaaChoices.data(), "Rendering", "FXAA",
+     [](const Config &c) { return c.rendering.fxaa ? 1.0f : 0.0f; },
+     [](float v) { lcs_post_settings().fxaa.store(v > 0.5f); }},
     {"FEX_FOG", "FOG DISTANCE", static_cast<std::uint32_t>(kFogChoices.size()), nullptr, nullptr, nullptr,
      0u, 0u, nullptr, 1u, kFogChoices.data(), "Rendering", "FogDistance",
      [](const Config &c) { return c.rendering.fog_distance; },
