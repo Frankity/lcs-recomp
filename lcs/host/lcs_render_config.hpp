@@ -105,6 +105,7 @@ struct RenderingConfiguration {
     float gamma{1.0f};        // 1 = unchanged, above 1 brightens the mid tones
     float vignette{0.0f};     // darkening towards the corners, 0 - 1
     bool fxaa{false};         // fast approximate anti-aliasing of the presented image
+    std::uint32_t texture_scale{1u};  // 2 = game textures are upscaled 2x when they are loaded (restart)
     bool hdr{false};  // 16-bit float colour targets, tone-mapped when presented (needs a restart)
     float ambient_light{1.0f};      // multiplies the ambient part of the game's lighting
     float directional_light{1.0f};  // multiplies the diffuse part of the game's lights (sun and lamps)

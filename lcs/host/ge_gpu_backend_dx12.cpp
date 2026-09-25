@@ -2,6 +2,7 @@
 #include "ge_present_shader.hpp"
 #include "lcs_render_config.hpp"
 #include "lcs_runtime_log.hpp"
+#include "lcs_texture_scale.hpp"
 
 #include <algorithm>
 #include <array>
@@ -138,7 +139,8 @@ struct Dx12Texture {
     std::uint64_t checksum{};
     std::uint64_t signature_epoch{};
     std::uint64_t last_used_epoch{};
-    std::vector<std::byte> rgba8;
+    std::vector<std::byte> rgba8;  // pixels waiting for the GPU upload; released afterwards
+    std::uint64_t cache_bytes{};   // size charged to the texture cache (the decoded, not the scaled, size)
 };
 
 struct Dx12FramebufferTarget {
@@ -2073,13 +2075,26 @@ bool prepare_texture_upload(Dx12GeState &s, const GeGpuDrawDescriptor &draw,
         for (Dx12FrameResources &retire : s.frames)
             retire.transient_resources.push_back(found->second.image);
         retire_texture_srv(s, found->second.srv_index);
-        s.texture_cache_bytes -= std::min<std::uint64_t>(s.texture_cache_bytes, found->second.rgba8.size());
+        s.texture_cache_bytes -= std::min<std::uint64_t>(s.texture_cache_bytes, found->second.cache_bytes);
         clear_texture_lookup_cache(s);
         s.textures.erase(found);
     }
+    // Game textures are upscaled when they are loaded. Two-dimensional draws (HUD, fonts, menus) and
+    // big textures keep their original size.
+    std::uint32_t upload_width = base_width;
+    std::uint32_t upload_height = base_height;
+    const std::uint64_t cache_bytes = packed.size();
+    std::vector<std::byte> original_pixels(
+        packed.begin(), packed.begin() + static_cast<std::size_t>(base_width) * base_height * 4u);
+    if (lcs_render_configuration().rendering.texture_scale == 2u && !draw.through &&
+        static_cast<std::uint64_t>(base_width) * base_height <= 256ull * 256ull) {
+        packed = upscale_texture_chain_2x(packed, base_width, base_height, mip_levels);
+        upload_width = base_width * 2u;
+        upload_height = base_height * 2u;
+    }
     const std::uint32_t entry_limit = lcs_render_configuration().rendering.texture_cache_entries;
     const std::uint64_t byte_limit = static_cast<std::uint64_t>(lcs_render_configuration().rendering.texture_cache_mb) * 1024ull * 1024ull;
-    while (s.textures.size() >= entry_limit || s.texture_cache_bytes + packed.size() > byte_limit) {
+    while (s.textures.size() >= entry_limit || s.texture_cache_bytes + cache_bytes > byte_limit) {
         auto victim = s.textures.end();
         for (auto it = s.textures.begin(); it != s.textures.end(); ++it) {
             if (it->second.last_used_epoch == s.frame_epoch) continue;
@@ -2095,7 +2110,7 @@ bool prepare_texture_upload(Dx12GeState &s, const GeGpuDrawDescriptor &draw,
             retire.transient_resources.push_back(victim->second.image);
         retire_texture_srv(s, victim->second.srv_index);
         s.texture_cache_bytes -= std::min<std::uint64_t>(
-            s.texture_cache_bytes, victim->second.rgba8.size());
+            s.texture_cache_bytes, victim->second.cache_bytes);
         clear_texture_lookup_cache(s);
         s.textures.erase(victim);
         ++s.report.evicted_textures;
@@ -2103,8 +2118,8 @@ bool prepare_texture_upload(Dx12GeState &s, const GeGpuDrawDescriptor &draw,
 
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = base_width;
-    desc.Height = base_height;
+    desc.Width = upload_width;
+    desc.Height = upload_height;
     desc.DepthOrArraySize = 1u;
     desc.MipLevels = static_cast<UINT16>(mip_levels);
     desc.Format = kColorFormat;
@@ -2114,13 +2129,14 @@ bool prepare_texture_upload(Dx12GeState &s, const GeGpuDrawDescriptor &draw,
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     Dx12Texture texture{};
     texture.descriptor = draw;
-    texture.width = base_width;
-    texture.height = base_height;
+    texture.width = upload_width;
+    texture.height = upload_height;
     texture.mip_levels = mip_levels;
     texture.checksum = checksum;
     texture.signature_epoch = s.frame_epoch;
     texture.last_used_epoch = s.frame_epoch;
     texture.rgba8 = std::move(packed);
+    texture.cache_bytes = cache_bytes;
     HRESULT hr = s.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                     IID_PPV_ARGS(&texture.image));
@@ -2139,9 +2155,9 @@ bool prepare_texture_upload(Dx12GeState &s, const GeGpuDrawDescriptor &draw,
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Texture2D.MipLevels = mip_levels;
     s.device->CreateShaderResourceView(texture.image.Get(), &srv, srv_cpu(s, texture.srv_index));
-    s.last_texture_rgba.assign(texture.rgba8.begin(), texture.rgba8.begin() + static_cast<std::size_t>(base_width) * base_height * 4u);
+    s.last_texture_rgba = std::move(original_pixels);
     const std::uint32_t srv_index = texture.srv_index;
-    s.texture_cache_bytes += texture.rgba8.size();
+    s.texture_cache_bytes += texture.cache_bytes;
     s.pending_texture_keys.push_back(key);
     s.textures.emplace(key, std::move(texture));
     ++s.report.decoded_texture_uploads;
@@ -2283,6 +2299,7 @@ void record_pending_texture_uploads(Dx12GeState &s, Dx12FrameResources &frame) n
         transition(s.list.Get(), texture.image.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         texture.pending_upload.Reset();
+        std::vector<std::byte>().swap(texture.rgba8);
     }
     s.pending_texture_keys.clear();
 }

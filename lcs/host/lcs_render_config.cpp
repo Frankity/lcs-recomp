@@ -249,6 +249,16 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.DirectionalLight must be between 0.5 and 2");
         return;
     }
+    if (key == "texturescale") {
+        const std::string mode = lowercase_copy(trim_copy(value));
+        if (mode == "off" || mode == "1" || mode == "1x" || mode == "none")
+            config.rendering.texture_scale = 1u;
+        else if (mode == "2" || mode == "2x")
+            config.rendering.texture_scale = 2u;
+        else
+            warning(config, line, "Rendering.TextureScale expects Off or 2x");
+        return;
+    }
     if (key == "hdr") {
         if (!parse_bool(value, config.rendering.hdr))
             warning(config, line, "Rendering.HDR expects true/false");

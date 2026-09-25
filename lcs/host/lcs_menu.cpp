@@ -32,6 +32,7 @@ constexpr std::uint32_t kDisplayScreen = 5u;
 // Second page of graphics settings. Screens 15 and up are blank multiplayer sub-pages: the game's
 // per-screen tables treat them as sub-pages, and the tab bar keeps showing the Display tab.
 constexpr std::uint32_t kGraphicsScreen = 15u;
+constexpr std::uint32_t kEffectsScreen = 16u;  // third page: image effects
 constexpr std::uint16_t kLinkAction = 3u;  // "go to the screen named by the item's target byte"
 constexpr std::uint32_t kItemTargetField = 11u;
 constexpr std::uint32_t kHudItem = 3u;
@@ -84,6 +85,8 @@ constexpr char kKeyPrefix[] = "FEX_";
 constexpr char kMoreKey[] = "FEX_MOR";
 constexpr char kBackKey[] = "FEX_BAK";
 constexpr char kGraphicsTitleKey[] = "FEX_GFX";
+constexpr char kMoreEffectsKey[] = "FEX_MFX";
+constexpr char kEffectsTitleKey[] = "FEX_EFX";
 
 // ms_lodDistScale: a 1.0f in the EBOOT that the camera update multiplies its LOD distance factor by.
 constexpr std::uint32_t kLodDistScaleAddress = 0x08B56790u;
@@ -153,6 +156,7 @@ constexpr std::array<FloatChoice, 2> kFxaaChoices{{{"OFF", 0.0f, "false"}, {"ON"
 constexpr std::array<FloatChoice, 7> kLightChoices{{
     {"60%", 0.6f, "0.6"}, {"80%", 0.8f, "0.8"}, {"100%", 1.0f, "1.0"}, {"120%", 1.2f, "1.2"},
     {"140%", 1.4f, "1.4"}, {"170%", 1.7f, "1.7"}, {"200%", 2.0f, "2.0"}}};
+constexpr std::array<FloatChoice, 2> kTextureScaleChoices{{{"OFF", 1.0f, "Off"}, {"2X", 2.0f, "2x"}}};
 constexpr std::array<FloatChoice, 6> kFogChoices{{
     {"OFF", 0.0f, "Off"}, {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"2X", 2.0f, "2.0"},
     {"3X", 3.0f, "3.0"}, {"4X", 4.0f, "4.0"}}};
@@ -333,25 +337,28 @@ Option g_options[] = {
      [](const Config &c) { return c.rendering.fog_distance; },
      [](float v) { lcs_set_fog_distance_scale(v); }},
     {"FEX_SHP", "SHARPNESS", static_cast<std::uint32_t>(kSharpnessChoices.size()), nullptr, nullptr, nullptr,
-     0u, 0u, nullptr, 1u, kSharpnessChoices.data(), "Rendering", "Sharpness",
+     0u, 0u, nullptr, 2u, kSharpnessChoices.data(), "Rendering", "Sharpness",
      [](const Config &c) { return c.rendering.sharpness; },
      [](float v) { lcs_post_settings().sharpness.store(v); }},
     {"FEX_CON", "CONTRAST", static_cast<std::uint32_t>(kContrastChoices.size()), nullptr, nullptr, nullptr,
-     0u, 0u, nullptr, 1u, kContrastChoices.data(), "Rendering", "Contrast",
+     0u, 0u, nullptr, 2u, kContrastChoices.data(), "Rendering", "Contrast",
      [](const Config &c) { return c.rendering.contrast; },
      [](float v) { lcs_post_settings().contrast.store(v); }},
     {"FEX_SAT", "SATURATION", static_cast<std::uint32_t>(kSaturationChoices.size()), nullptr, nullptr, nullptr,
-     0u, 0u, nullptr, 1u, kSaturationChoices.data(), "Rendering", "Saturation",
+     0u, 0u, nullptr, 2u, kSaturationChoices.data(), "Rendering", "Saturation",
      [](const Config &c) { return c.rendering.saturation; },
      [](float v) { lcs_post_settings().saturation.store(v); }},
     {"FEX_GAM", "GAMMA", static_cast<std::uint32_t>(kGammaChoices.size()), nullptr, nullptr, nullptr,
-     0u, 0u, nullptr, 1u, kGammaChoices.data(), "Rendering", "Gamma",
+     0u, 0u, nullptr, 2u, kGammaChoices.data(), "Rendering", "Gamma",
      [](const Config &c) { return c.rendering.gamma; },
      [](float v) { lcs_post_settings().gamma.store(v); }},
     {"FEX_VIG", "VIGNETTE", static_cast<std::uint32_t>(kVignetteChoices.size()), nullptr, nullptr, nullptr,
-     0u, 0u, nullptr, 1u, kVignetteChoices.data(), "Rendering", "Vignette",
+     0u, 0u, nullptr, 2u, kVignetteChoices.data(), "Rendering", "Vignette",
      [](const Config &c) { return c.rendering.vignette; },
      [](float v) { lcs_post_settings().vignette.store(v); }},
+    {"FEX_TXS", "TEXTURE SCALE", static_cast<std::uint32_t>(kTextureScaleChoices.size()), nullptr, nullptr, nullptr,
+     0u, 0u, nullptr, 2u, kTextureScaleChoices.data(), "Rendering", "TextureScale",
+     [](const Config &c) { return static_cast<float>(c.rendering.texture_scale); }, nullptr},
     {"FEX_HSC", "HUD SCALE", static_cast<std::uint32_t>(kHudScales.size()),
      [](const Config &c) {
          std::uint32_t best = 0u;
@@ -386,16 +393,29 @@ std::uint32_t g_scratch{};
 std::uint32_t g_menu{};
 std::uint32_t g_tab_table{};
 
-// One page of rows: the game's own rows (Display only), then the options placed on it, then a link
-// row (MORE GRAPHICS on Display, BACK on the graphics page).
+// A link row opens another page: an action-3 item whose target byte is the screen to go to.
+struct Link {
+    const char *key;
+    std::uint32_t target;
+};
+
+// One page of rows: the game's own rows (Display only), then the options placed on it, then its
+// link rows (MORE ... and BACK).
 struct Page {
     std::uint32_t screen;
     std::uint32_t first_option_item;
+    const char *title;  // text key of the page title (the game's own title on Display)
     std::vector<Option *> options;
+    std::vector<Link> links;
     std::uint32_t scroll;
-    std::uint32_t rows() const { return first_option_item + static_cast<std::uint32_t>(options.size()) + 1u; }
+    std::uint32_t rows() const {
+        return first_option_item + static_cast<std::uint32_t>(options.size() + links.size());
+    }
 };
-std::array<Page, 2> g_pages{{{kDisplayScreen, kFirstOptionItem, {}, 0u}, {kGraphicsScreen, 0u, {}, 0u}}};
+std::array<Page, 3> g_pages{{
+    {kDisplayScreen, kFirstOptionItem, nullptr, {}, {{kMoreKey, kGraphicsScreen}}, 0u},
+    {kGraphicsScreen, 0u, kGraphicsTitleKey, {}, {{kMoreEffectsKey, kEffectsScreen}, {kBackKey, kDisplayScreen}}, 0u},
+    {kEffectsScreen, 0u, kEffectsTitleKey, {}, {{kBackKey, kGraphicsScreen}}, 0u}}};
 
 Page *page_for(std::uint32_t screen) noexcept {
     for (Page &page : g_pages)
@@ -510,7 +530,10 @@ static void install_pages(psprecomp::GuestMemory &memory) {
         }
     }
     for (Option &option : g_options) g_pages[option.page].options.push_back(&option);
-    bool free_slots = memory.load16(hud) != 0u && key_equals(memory, screen_base(kGraphicsScreen), "FEH_MP");
+    bool free_slots = memory.load16(hud) != 0u;
+    for (const Page &page : g_pages)
+        if (page.title != nullptr)  // the extra pages sit on blank multiplayer sub-pages
+            free_slots = free_slots && key_equals(memory, screen_base(page.screen), "FEH_MP");
     for (const Page &page : g_pages) {
         if (page.rows() > 14u) free_slots = false;  // the last slot must stay empty
         for (std::uint32_t item = page.first_option_item; item <= page.rows(); ++item)
@@ -530,13 +553,11 @@ static void install_pages(psprecomp::GuestMemory &memory) {
             option->pending_index = option->active_index;
             write_item(memory, item_base(page.screen, item++), hud, kOptionAction, option->key, 0u);
         }
-        // The link row: opens the other page (Display -> graphics, graphics -> Display).
-        const bool on_display = page.screen == kDisplayScreen;
-        write_item(memory, item_base(page.screen, item), hud, kLinkAction,
-                   on_display ? kMoreKey : kBackKey,
-                   static_cast<std::uint8_t>(on_display ? kGraphicsScreen : kDisplayScreen));
+        for (const Link &link : page.links)
+            write_item(memory, item_base(page.screen, item++), hud, kLinkAction, link.key,
+                       static_cast<std::uint8_t>(link.target));
+        if (page.title != nullptr) write_key(memory, screen_base(page.screen), page.title);
     }
-    write_key(memory, screen_base(kGraphicsScreen), kGraphicsTitleKey);
     for (const Page &page : g_pages)
         for (std::uint32_t item = 0u; item < page.rows(); ++item)
             memory.store16(item_base(page.screen, item) + kYField,
@@ -628,7 +649,8 @@ bool lcs_menu_text_override(psprecomp::GuestMemory &memory, std::uint32_t key_ad
     }
     static constexpr struct { const char *key; const char *text; } kFixedTexts[] = {
         {kQuitTabKey, "QUIT"}, {kQuitQuestionKey, "QUIT THE GAME?"}, {kMoreKey, "MORE GRAPHICS"},
-        {kBackKey, "BACK"}, {kGraphicsTitleKey, "GRAPHICS"}};
+        {kBackKey, "BACK"}, {kGraphicsTitleKey, "GRAPHICS"}, {kMoreEffectsKey, "MORE EFFECTS"},
+        {kEffectsTitleKey, "EFFECTS"}};
     for (const auto &fixed : kFixedTexts) {
         if (!key_equals(memory, key_address, fixed.key)) continue;
         write_wide(memory, g_scratch + kLabelOffset, fixed.text);
