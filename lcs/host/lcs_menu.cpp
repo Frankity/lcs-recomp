@@ -104,6 +104,13 @@ struct HudScale {
 constexpr std::array<HudScale, 4> kHudScales{{
     {"25%", "0.25"}, {"50%", "0.5"}, {"75%", "0.75"}, {"100%", "1.0"}}};
 constexpr std::array<const char *, 3> kFilters{"BILINEAR", "NEAREST", "INTEGER"};
+struct FpsSize {
+    const char *name;
+    float scale;
+    const char *value;
+};
+constexpr std::array<FpsSize, 4> kFpsSizes{{
+    {"TINY", 0.75f, "0.75"}, {"SMALL", 1.0f, "1.0"}, {"MEDIUM", 1.25f, "1.25"}, {"LARGE", 1.5f, "1.5"}}};
 
 std::string bool_text(std::uint32_t index) { return index != 0u ? "ON" : "OFF"; }
 std::string bool_value(std::uint32_t index) { return index != 0u ? "true" : "false"; }
@@ -218,10 +225,22 @@ Option g_options[] = {
      [](std::uint32_t i) { return std::string(kHudScales[i].percent); },
      [](std::uint32_t i) { return lcs_save_config_value("Display", "HudScale", kHudScales[i].value); },
      0u, 0u},
-    {"FEX_FPC", "SHOW FPS", 2u,
-     [](const Config &c) { return c.display.show_fps ? 1u : 0u; },
-     bool_text,
-     [](std::uint32_t i) { return lcs_save_config_value("Display", "ShowFPS", bool_value(i)); },
+    {"FEX_FPC", "FPS COUNTER", static_cast<std::uint32_t>(kFpsSizes.size() + 1u),
+     [](const Config &c) {
+         if (!c.display.show_fps) return 0u;
+         std::uint32_t best = 0u;
+         for (std::uint32_t i = 1u; i < kFpsSizes.size(); ++i)
+             if (std::abs(kFpsSizes[i].scale - c.display.fps_scale) <
+                 std::abs(kFpsSizes[best].scale - c.display.fps_scale))
+                 best = i;
+         return best + 1u;
+     },
+     [](std::uint32_t i) { return i == 0u ? std::string("OFF") : std::string(kFpsSizes[i - 1u].name); },
+     [](std::uint32_t i) {
+         if (i == 0u) return lcs_save_config_value("Display", "ShowFPS", "false");
+         return lcs_save_config_value("Display", "ShowFPS", "true") &&
+                lcs_save_config_value("Display", "FpsScale", kFpsSizes[i - 1u].value);
+     },
      0u, 0u},
 };
 constexpr std::uint32_t kOptionCount = sizeof(g_options) / sizeof(g_options[0]);

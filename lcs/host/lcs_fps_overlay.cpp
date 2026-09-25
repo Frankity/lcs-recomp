@@ -152,8 +152,12 @@ void fps_overlay_render_frame(std::uint32_t selected_framebuffer,
 
     const float width = static_cast<float>(logical_width != 0u ? logical_width : 480u);
     const float height = static_cast<float>(logical_height != 0u ? logical_height : 272u);
-    const float scale_x = 1.5f * width / 480.0f;
-    const float scale_y = 1.5f * height / 272.0f;
+    static const float glyph_scale = [] {
+        const LcsConfiguration &config = lcs_render_configuration();
+        return config.initialized ? config.display.fps_scale : 1.0f;
+    }();
+    const float scale_x = glyph_scale * width / 480.0f;
+    const float scale_y = glyph_scale * height / 272.0f;
     const float margin_x = 8.0f * width / 480.0f;
     const float margin_y = 8.0f * height / 272.0f;
 

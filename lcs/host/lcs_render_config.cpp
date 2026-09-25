@@ -190,6 +190,11 @@ void apply_display_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Display.ShowFPS expects true/false");
         return;
     }
+    if (key == "fpsscale" || key == "fpssize") {
+        if (!parse_float(value, 0.5f, 3.0f, config.display.fps_scale))
+            warning(config, line, "Display.FpsScale must be between 0.5 and 3.0");
+        return;
+    }
     if (key == "hudscale") {
         if (!parse_float(value, 0.25f, 1.0f, config.display.hud_scale))
             warning(config, line, "Display.HudScale must be between 0.25 and 1.0");

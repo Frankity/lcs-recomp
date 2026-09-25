@@ -45,6 +45,7 @@ struct DisplayConfiguration {
     DisplayUpscaleFilter upscale_filter{DisplayUpscaleFilter::Nearest};
     bool integer_scale{false};
     bool show_fps{false};
+    float fps_scale{1.0f};  // glyph size of the FPS counter, in PSP pixels per font pixel
     float hud_scale{1.0f};
 };
 
