@@ -65,8 +65,11 @@ constexpr std::uint32_t kQuitTabId = 9u;
 constexpr std::uint32_t kQuitScreen = 8u;       // a blank screen in the game's table
 constexpr std::uint32_t kTemplateScreen = 13u;  // "quit?" confirmation: question + NO + YES
 constexpr std::uint16_t kQuitAction = 40u;
-constexpr std::uint32_t kCrossActionTable = 0x08B2DFB0u;  // Cross press, indexed by action - 5
-constexpr std::uint32_t kCrossToggleHandler = 0x08ADA268u;
+// Cross press on an item is dispatched on its action through this table (index = action - 2).
+// Action 42 ("yes" of the game's own confirmations) is a case in the generated code that already
+// has a hook, so the QUIT item is pointed at it.
+constexpr std::uint32_t kPressActionTable = 0x08B2E178u;
+constexpr std::uint32_t kPressYesHandler = 0x08ADE4DCu;
 constexpr char kQuitTabKey[] = "FEX_QIT";
 constexpr char kQuitQuestionKey[] = "FEX_QQ";
 constexpr char kYesKey[] = "FEU_YES";
@@ -228,6 +231,7 @@ std::uint32_t g_scratch{};
 std::uint32_t g_menu{};
 std::uint32_t g_scroll{};
 std::uint32_t g_tab_table{};
+std::uint32_t g_previous_screen{};
 
 std::uint32_t item_base(std::uint32_t screen, std::uint32_t item) noexcept {
     return kScreenTable + kScreenStride * screen + kItemsOffset + kItemStride * item;
@@ -370,7 +374,7 @@ static void install_quit_tab(psprecomp::GuestMemory &memory, std::uint32_t scrat
     memory.store16(item_base(kQuitScreen, 1u), kQuitAction);
     write_key(memory, item_base(kQuitScreen, 1u) + 2u, kYesKey);
     memory.store8(item_base(kQuitScreen, 1u) + 11u, static_cast<std::uint8_t>(kQuitScreen));
-    memory.store32(kCrossActionTable + 4u * (kQuitAction - 5u), kCrossToggleHandler);
+    memory.store32(kPressActionTable + 4u * (kQuitAction - 2u), kPressYesHandler);
     (void)tmpl;
 
     g_tab_table = table;
@@ -437,7 +441,12 @@ bool lcs_menu_option_step(psprecomp::GuestMemory &memory, std::uint32_t menu,
 
 void lcs_menu_tick(psprecomp::GuestMemory &memory) noexcept {
     if (g_scratch == 0u || g_menu == 0u || !memory.contains(g_menu + kMenuItemField, 4u)) return;
-    if (memory.load32(g_menu + kMenuScreenField) != kDisplayScreen) return;
+    const std::uint32_t current_screen = memory.load32(g_menu + kMenuScreenField);
+    const bool entered_quit = current_screen == kQuitScreen && g_previous_screen != kQuitScreen;
+    g_previous_screen = current_screen;
+    if (entered_quit && g_tab_table != 0u)
+        memory.store32(g_menu + kMenuItemField, 1u);  // start on YES, not on the question
+    if (current_screen != kDisplayScreen) return;
 
     const std::uint32_t rows = kFirstOptionItem + kOptionCount;
     const std::uint32_t selected = std::min(memory.load32(g_menu + kMenuItemField), rows - 1u);
@@ -466,6 +475,7 @@ bool lcs_menu_tab_screen(psprecomp::GuestMemory &memory, std::uint32_t menu) noe
     if (g_tab_table == 0u || !memory.contains(menu, kMenuScreenField + 4u)) return false;
     if (memory.load32(menu) != kQuitTabId) return false;
     memory.store32(menu + kMenuScreenField, kQuitScreen);
+    g_menu = menu;
     return true;
 }
 
