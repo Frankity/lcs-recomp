@@ -1075,6 +1075,14 @@ PreparedLighting prepare_lighting(bool has_vertex_color,
     state.emissive = rgb_command(commands[0x54u], 0.0f);
     const float ambient_alpha = static_cast<float>(data24(commands[0x5Du]) & 0xFFu) / 255.0f;
     state.global_ambient = rgb_command(commands[0x5Cu], ambient_alpha);
+    // Host lighting controls (Rendering.AmbientLight / DirectionalLight): they scale the game's own
+    // ambient and diffuse light colours, so day/night and weather still drive the result.
+    const PostProcessSettings &look = lcs_post_settings();
+    const float ambient_scale = look.ambient_light.load(std::memory_order_relaxed);
+    const float directional_scale = look.directional_light.load(std::memory_order_relaxed);
+    state.global_ambient.r *= ambient_scale;
+    state.global_ambient.g *= ambient_scale;
+    state.global_ambient.b *= ambient_scale;
     const float exponent = decode_float24(data24(commands[0x5Bu]));
     state.specular_exponent = (!std::isfinite(exponent) || exponent < 0.0f) ? 0.0f : exponent;
 
@@ -1112,6 +1120,12 @@ PreparedLighting prepare_lighting(bool has_vertex_color,
         }
         prepared.ambient = rgb_command(commands[0x8Fu + light * 3u]);
         prepared.diffuse = rgb_command(commands[0x90u + light * 3u]);
+        prepared.ambient.r *= ambient_scale;
+        prepared.ambient.g *= ambient_scale;
+        prepared.ambient.b *= ambient_scale;
+        prepared.diffuse.r *= directional_scale;
+        prepared.diffuse.g *= directional_scale;
+        prepared.diffuse.b *= directional_scale;
         prepared.specular = rgb_command(commands[0x91u + light * 3u]);
     }
     return state;

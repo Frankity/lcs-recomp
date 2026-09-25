@@ -239,6 +239,16 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.LodScale must be between 0.25 and 8");
         return;
     }
+    if (key == "ambientlight" || key == "ambient") {
+        if (!parse_float(value, 0.5f, 2.0f, config.rendering.ambient_light))
+            warning(config, line, "Rendering.AmbientLight must be between 0.5 and 2");
+        return;
+    }
+    if (key == "directionallight" || key == "sunlight") {
+        if (!parse_float(value, 0.5f, 2.0f, config.rendering.directional_light))
+            warning(config, line, "Rendering.DirectionalLight must be between 0.5 and 2");
+        return;
+    }
     if (key == "fxaa") {
         if (!parse_bool(value, config.rendering.fxaa))
             warning(config, line, "Rendering.FXAA expects true/false");
@@ -824,6 +834,8 @@ PostProcessSettings &lcs_post_settings() noexcept {
         settings.gamma.store(rendering.gamma);
         settings.vignette.store(rendering.vignette);
         settings.fxaa.store(rendering.fxaa);
+        settings.ambient_light.store(rendering.ambient_light);
+        settings.directional_light.store(rendering.directional_light);
         return true;
     }();
     (void)initialized;

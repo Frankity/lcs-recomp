@@ -150,6 +150,9 @@ struct DrawDistanceChoice {
 constexpr std::array<DrawDistanceChoice, 5> kDrawDistanceChoices{{
     {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"1.5X", 1.5f, "1.5"}, {"2X", 2.0f, "2.0"}, {"3X", 3.0f, "3.0"}}};
 constexpr std::array<FloatChoice, 2> kFxaaChoices{{{"OFF", 0.0f, "false"}, {"ON", 1.0f, "true"}}};
+constexpr std::array<FloatChoice, 7> kLightChoices{{
+    {"60%", 0.6f, "0.6"}, {"80%", 0.8f, "0.8"}, {"100%", 1.0f, "1.0"}, {"120%", 1.2f, "1.2"},
+    {"140%", 1.4f, "1.4"}, {"170%", 1.7f, "1.7"}, {"200%", 2.0f, "2.0"}}};
 constexpr std::array<FloatChoice, 6> kFogChoices{{
     {"OFF", 0.0f, "Off"}, {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"2X", 2.0f, "2.0"},
     {"3X", 3.0f, "3.0"}, {"4X", 4.0f, "4.0"}}};
@@ -314,6 +317,14 @@ Option g_options[] = {
      0u, 0u, nullptr, 1u, kFxaaChoices.data(), "Rendering", "FXAA",
      [](const Config &c) { return c.rendering.fxaa ? 1.0f : 0.0f; },
      [](float v) { lcs_post_settings().fxaa.store(v > 0.5f); }},
+    {"FEX_AMB", "AMBIENT LIGHT", static_cast<std::uint32_t>(kLightChoices.size()), nullptr, nullptr, nullptr,
+     0u, 0u, nullptr, 1u, kLightChoices.data(), "Rendering", "AmbientLight",
+     [](const Config &c) { return c.rendering.ambient_light; },
+     [](float v) { lcs_post_settings().ambient_light.store(v); }},
+    {"FEX_SUN", "SUN LIGHT", static_cast<std::uint32_t>(kLightChoices.size()), nullptr, nullptr, nullptr,
+     0u, 0u, nullptr, 1u, kLightChoices.data(), "Rendering", "DirectionalLight",
+     [](const Config &c) { return c.rendering.directional_light; },
+     [](float v) { lcs_post_settings().directional_light.store(v); }},
     {"FEX_FOG", "FOG DISTANCE", static_cast<std::uint32_t>(kFogChoices.size()), nullptr, nullptr, nullptr,
      0u, 0u, nullptr, 1u, kFogChoices.data(), "Rendering", "FogDistance",
      [](const Config &c) { return c.rendering.fog_distance; },

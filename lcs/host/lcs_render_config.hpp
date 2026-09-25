@@ -105,6 +105,8 @@ struct RenderingConfiguration {
     float gamma{1.0f};        // 1 = unchanged, above 1 brightens the mid tones
     float vignette{0.0f};     // darkening towards the corners, 0 - 1
     bool fxaa{false};         // fast approximate anti-aliasing of the presented image
+    float ambient_light{1.0f};      // multiplies the ambient part of the game's lighting
+    float directional_light{1.0f};  // multiplies the diffuse part of the game's lights (sun and lamps)
     bool experimental_gpu_color_preview{false};
     bool gpu_geometry_debug_colors{false};
     std::uint64_t dump_gpu_frame_vblank{0u};
@@ -180,6 +182,9 @@ struct PostProcessSettings {
     std::atomic<float> gamma{1.0f};
     std::atomic<float> vignette{0.0f};
     std::atomic<bool> fxaa{false};
+    // Lighting is not post-processing, but it is changed the same way (live, from the menu).
+    std::atomic<float> ambient_light{1.0f};
+    std::atomic<float> directional_light{1.0f};
 };
 [[nodiscard]] PostProcessSettings &lcs_post_settings() noexcept;
 
