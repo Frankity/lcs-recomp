@@ -881,8 +881,12 @@ GeGpuHardwareTransform build_gpu_hardware_transform(
         ? 0.0f : decode_float24(data24(commands[0x4Au]));
     hw.uv_offset_v = texture_coordinates_already_generated
         ? 0.0f : decode_float24(data24(commands[0x4Bu]));
-    hw.fog_end = decode_float24(data24(commands[0xCDu]));
-    hw.fog_slope = decode_float24(data24(commands[0xCEu]));
+    {
+        // A larger fog distance factor pushes both the start and the end of the fog further away.
+        const float fog_scale = std::max(lcs_fog_distance_scale(), 0.01f);
+        hw.fog_end = decode_float24(data24(commands[0xCDu])) * fog_scale;
+        hw.fog_slope = decode_float24(data24(commands[0xCEu])) / fog_scale;
+    }
     hw.depth_clip_enabled = (data24(commands[0x1Cu]) & 1u) != 0u;
     hw.cull_enabled = gpu_hardware_cull_enabled() && (data24(commands[0x1Du]) & 1u) != 0u;
     hw.accept_counter_clockwise = (data24(commands[0x9Bu]) & 1u) != 0u;
@@ -1334,9 +1338,10 @@ bool decode_vertex(const psprecomp::GuestMemory &memory, std::uint32_t address,
     }
 
     const Vec3 view = transform_4x3(transform.view, world_position);
-    if ((data24(commands[0x1Fu]) & 1u) != 0u) {
-        const float fog_end = decode_float24(data24(commands[0xCDu]));
-        const float fog_slope = decode_float24(data24(commands[0xCEu]));
+    const float fog_scale = lcs_fog_distance_scale();
+    if ((data24(commands[0x1Fu]) & 1u) != 0u && fog_scale > 0.0f) {
+        const float fog_end = decode_float24(data24(commands[0xCDu])) * fog_scale;
+        const float fog_slope = decode_float24(data24(commands[0xCEu])) / fog_scale;
         const float fog = (view.z + fog_end) * fog_slope;
         vertex.fog_factor = std::isfinite(fog) ? std::clamp(fog, 0.0f, 1.0f) : 1.0f;
     } else {
@@ -1408,9 +1413,10 @@ bool decode_vertex_0115_fast(const psprecomp::GuestMemory &memory, std::uint32_t
     };
     const Vec3 world_position = transform_4x3(transform.world, model_position);
     const Vec3 view = transform_4x3(transform.view, world_position);
-    if ((data24(commands[0x1Fu]) & 1u) != 0u) {
-        const float fog_end = decode_float24(data24(commands[0xCDu]));
-        const float fog_slope = decode_float24(data24(commands[0xCEu]));
+    const float fog_scale = lcs_fog_distance_scale();
+    if ((data24(commands[0x1Fu]) & 1u) != 0u && fog_scale > 0.0f) {
+        const float fog_end = decode_float24(data24(commands[0xCDu])) * fog_scale;
+        const float fog_slope = decode_float24(data24(commands[0xCEu])) / fog_scale;
         const float fog = (view.z + fog_end) * fog_slope;
         vertex.fog_factor = std::isfinite(fog) ? std::clamp(fog, 0.0f, 1.0f) : 1.0f;
     } else {
@@ -3927,10 +3933,11 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             gpu_draw.depth_test_enabled = (data24(commands[0x23u]) & 1u) != 0u;
             gpu_draw.depth_write_enabled = (data24(commands[0xE7u]) & 1u) == 0u;
             gpu_draw.depth_function = data24(commands[0xDEu]) & 7u;
-            gpu_draw.fog_enabled = (data24(commands[0x1Fu]) & 1u) != 0u;
+            const float fog_scale = lcs_fog_distance_scale();
+            gpu_draw.fog_enabled = (data24(commands[0x1Fu]) & 1u) != 0u && fog_scale > 0.0f;
             gpu_draw.fog_color = data24(commands[0xCFu]) & 0x00FFFFFFu;
-            gpu_draw.fog_end = decode_float24(data24(commands[0xCDu]));
-            gpu_draw.fog_slope = decode_float24(data24(commands[0xCEu]));
+            gpu_draw.fog_end = decode_float24(data24(commands[0xCDu])) * std::max(fog_scale, 0.01f);
+            gpu_draw.fog_slope = decode_float24(data24(commands[0xCEu])) / std::max(fog_scale, 0.01f);
             const std::uint32_t gpu_clear = data24(commands[0xD3u]);
             gpu_draw.clear_mode = (gpu_clear & 1u) != 0u;
             gpu_draw.clear_color = (gpu_clear & 0x100u) != 0u;

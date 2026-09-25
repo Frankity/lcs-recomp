@@ -97,6 +97,7 @@ struct RenderingConfiguration {
     BloomMode bloom{BloomMode::Low};  // glow around bright lights, added when presenting
     float lod_scale{2.0f};  // multiplies the distances at which the game switches to lower detail
     float draw_distance{1.5f};  // multiplies the distance at which pedestrians and cars are generated
+    float fog_distance{1.0f};  // multiplies the distance of the game's fog; 0 turns the fog off
     bool experimental_gpu_color_preview{false};
     bool gpu_geometry_debug_colors{false};
     std::uint64_t dump_gpu_frame_vblank{0u};
@@ -162,6 +163,11 @@ struct LcsConfiguration {
 void initialize_lcs_render_configuration(const std::filesystem::path &executable_directory);
 
 [[nodiscard]] const LcsConfiguration &lcs_render_configuration();
+
+// Fog distance factor (0 = fog off), applied where the GE fog registers are decoded. It starts at
+// Rendering.FogDistance and can be changed while the game runs.
+[[nodiscard]] float lcs_fog_distance_scale() noexcept;
+void lcs_set_fog_distance_scale(float scale) noexcept;
 
 // Writes `key=value` into `section` of the loaded ini file (other lines are kept). The running
 // process keeps its current settings; the change applies on the next launch.

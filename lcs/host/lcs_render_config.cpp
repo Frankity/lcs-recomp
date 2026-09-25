@@ -2,6 +2,7 @@
 #include "lcs_widescreen.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cerrno>
@@ -236,6 +237,15 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
     if (key == "lodscale" || key == "loddistancescale") {
         if (!parse_float(value, 0.25f, 8.0f, config.rendering.lod_scale))
             warning(config, line, "Rendering.LodScale must be between 0.25 and 8");
+        return;
+    }
+    if (key == "fogdistance" || key == "fog") {
+        const std::string mode = lowercase_copy(trim_copy(value));
+        if (mode == "off" || mode == "none" || mode == "false" || mode == "0") {
+            config.rendering.fog_distance = 0.0f;
+        } else if (!parse_float(value, 0.5f, 4.0f, config.rendering.fog_distance)) {
+            warning(config, line, "Rendering.FogDistance must be Off or between 0.5 and 4");
+        }
         return;
     }
     if (key == "drawdistance" || key == "populationdistance") {
@@ -768,6 +778,23 @@ void initialize_lcs_render_configuration(const std::filesystem::path &executable
 
 const LcsConfiguration &lcs_render_configuration() {
     return global_configuration();
+}
+
+namespace {
+std::atomic<float> g_fog_distance_scale{-1.0f};  // negative until first read
+}
+
+float lcs_fog_distance_scale() noexcept {
+    float scale = g_fog_distance_scale.load(std::memory_order_relaxed);
+    if (scale < 0.0f) {
+        scale = global_configuration().rendering.fog_distance;
+        g_fog_distance_scale.store(scale, std::memory_order_relaxed);
+    }
+    return scale;
+}
+
+void lcs_set_fog_distance_scale(float scale) noexcept {
+    g_fog_distance_scale.store(std::max(scale, 0.0f), std::memory_order_relaxed);
 }
 
 bool lcs_save_config_value(const std::string &section, const std::string &key,
