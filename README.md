@@ -4,6 +4,8 @@ GTA: Liberty City Stories PC port, built on [PSPRecomp](https://github.com/jessi
 
 ## Setup
 
+Requires the US v1.05 release (ULUS-10041).
+
 Place your decrypted `EBOOT.ELF` and the disc's `PSP_GAME` folder in `game/` for the [release](https://github.com/elmasas/lcs-recomp/releases/latest), or in `lcs/game/` when building from source.
 
 ## Build
