@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -76,6 +77,8 @@ int main(int argc, char **argv) {
             static_cast<std::uint32_t>((image_end + 0xFFu) & ~0xFFull);
         const std::uint32_t user_arena_start = menu_scratch + lcs::kMenuScratchBytes;
         lcs::lcs_menu_install(runtime.memory(), menu_scratch);
+        if (!lcs::lcs_apply_lod_scale(runtime.memory(), lcs::lcs_render_configuration().rendering.lod_scale))
+            std::cerr << "[lod] LOD distance constant not found; LodScale ignored\n";
         lcs::display_window_init();
         lcs::install_profile(runtime, user_arena_start);
 

@@ -233,6 +233,11 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.InternalScale must be between 1 and 8");
         return;
     }
+    if (key == "lodscale" || key == "loddistancescale" || key == "drawdistance") {
+        if (!parse_float(value, 0.25f, 8.0f, config.rendering.lod_scale))
+            warning(config, line, "Rendering.LodScale must be between 0.25 and 8");
+        return;
+    }
     if (key == "bloom") {
         const std::string mode = lowercase_copy(trim_copy(value));
         if (mode == "off" || mode == "false" || mode == "0" || mode == "none")

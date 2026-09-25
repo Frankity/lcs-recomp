@@ -95,6 +95,7 @@ struct RenderingConfiguration {
     bool dx12_ge_color{true};
     bool smaa{false};
     BloomMode bloom{BloomMode::Low};  // glow around bright lights, added when presenting
+    float lod_scale{2.0f};  // multiplies the distances at which the game switches to lower detail
     bool experimental_gpu_color_preview{false};
     bool gpu_geometry_debug_colors{false};
     std::uint64_t dump_gpu_frame_vblank{0u};

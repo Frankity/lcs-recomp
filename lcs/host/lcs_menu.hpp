@@ -44,6 +44,10 @@ void lcs_menu_install(psprecomp::GuestMemory &memory, std::uint32_t scratch_addr
 // When Cross is pressed on the QUIT page's YES item, closes the game and returns true.
 [[nodiscard]] bool lcs_menu_quit_press(psprecomp::GuestMemory &memory, std::uint32_t menu) noexcept;
 
+// Writes the LOD distance factor the camera update multiplies its detail distances by (see
+// lcs_menu.cpp). Returns false when the game's constant is not where it is expected.
+[[nodiscard]] bool lcs_apply_lod_scale(psprecomp::GuestMemory &memory, float scale) noexcept;
+
 // Called once per frame: scrolls the Display list so the selected row stays visible.
 void lcs_menu_tick(psprecomp::GuestMemory &memory) noexcept;
 

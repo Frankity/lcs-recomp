@@ -1698,6 +1698,53 @@ bool defer_current_thread_for_io_handoff(psprecomp::AllegrexContext &ctx,
     return true;
 }
 
+// Debug aid: LCS_POKE="0x08E24880=4.0@2500,0x08B55CE8=1@2500" writes a float (or, with a 0x
+// prefix on the value, a 32-bit word) into guest memory once the given vblank is reached. Used to
+// find game variables by changing them and looking at the result.
+void poke_memory_if_requested(psprecomp::GuestMemory &memory) {
+    struct Poke {
+        std::uint32_t address{};
+        std::uint32_t bits{};
+        std::uint64_t vblank{};
+        bool done{};
+    };
+    static std::vector<Poke> pokes = [] {
+        std::vector<Poke> list;
+        const char *text = std::getenv("LCS_POKE");
+        if (text == nullptr) return list;
+        std::string rest = text;
+        std::size_t start = 0u;
+        while (start < rest.size()) {
+            std::size_t end = rest.find(',', start);
+            if (end == std::string::npos) end = rest.size();
+            const std::string item = rest.substr(start, end - start);
+            start = end + 1u;
+            const std::size_t equals = item.find('=');
+            const std::size_t at = item.find('@');
+            if (equals == std::string::npos) continue;
+            Poke poke;
+            poke.address = static_cast<std::uint32_t>(std::strtoull(item.c_str(), nullptr, 0));
+            const std::string value = item.substr(equals + 1u, at == std::string::npos ? std::string::npos : at - equals - 1u);
+            if (value.rfind("0x", 0) == 0) {
+                poke.bits = static_cast<std::uint32_t>(std::strtoull(value.c_str(), nullptr, 0));
+            } else {
+                const float number = std::strtof(value.c_str(), nullptr);
+                std::memcpy(&poke.bits, &number, sizeof(poke.bits));
+            }
+            poke.vblank = at == std::string::npos ? 0u : std::strtoull(item.c_str() + at + 1u, nullptr, 0);
+            list.push_back(poke);
+        }
+        return list;
+    }();
+    for (Poke &poke : pokes) {
+        if (poke.done || display_vblank_index < poke.vblank) continue;
+        if (memory.contains(poke.address, 4u)) memory.store32(poke.address, poke.bits);
+        poke.done = true;
+        std::cerr << "[poke] " << psprecomp::hex32(poke.address) << " <- " << psprecomp::hex32(poke.bits)
+                  << " at vblank " << display_vblank_index << "\n";
+    }
+}
+
 void dump_ram_if_requested(const psprecomp::GuestMemory &memory) {
     struct Config {
         std::filesystem::path directory;
@@ -3891,6 +3938,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         check_wall_clock_limit(rt, 0x3Fu);
         reset_pc_profile_on_key();
         dump_ram_if_requested(rt.memory());
+        poke_memory_if_requested(rt.memory());
         if (std::getenv("LCS_TICK_DIAG") != nullptr) {
             std::cerr << "[tick] WaitVblank uid=" << thread_table.current_uid
                       << " ra=" << psprecomp::hex32(ctx.gpr[31]) << " vblank=" << display_vblank_index

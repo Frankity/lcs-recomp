@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 
@@ -75,6 +76,10 @@ constexpr char kQuitQuestionKey[] = "FEX_QQ";
 constexpr char kYesKey[] = "FEU_YES";
 constexpr char kKeyPrefix[] = "FEX_";
 
+// ms_lodDistScale: a 1.0f in the EBOOT that the camera update multiplies its LOD distance factor by.
+constexpr std::uint32_t kLodDistScaleAddress = 0x08B56790u;
+constexpr std::uint32_t kOneAsFloat = 0x3F800000u;
+
 using Config = LcsConfiguration;
 
 struct Option {
@@ -86,6 +91,8 @@ struct Option {
     bool (*save)(std::uint32_t index);
     std::uint32_t active_index;
     std::uint32_t pending_index;
+    // Optional: applies the choice to the running game right away (no restart needed).
+    void (*apply)(psprecomp::GuestMemory &memory, std::uint32_t index){};
 };
 
 constexpr std::array<std::uint32_t, 5> kFrameRates{30u, 60u, 120u, 200u, 240u};
@@ -104,6 +111,14 @@ struct HudScale {
 constexpr std::array<HudScale, 4> kHudScales{{
     {"25%", "0.25"}, {"50%", "0.5"}, {"75%", "0.75"}, {"100%", "1.0"}}};
 constexpr std::array<const char *, 3> kFilters{"BILINEAR", "NEAREST", "INTEGER"};
+struct LodChoice {
+    const char *name;
+    float scale;
+    const char *value;
+};
+constexpr std::array<LodChoice, 6> kLodChoices{{
+    {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"1.5X", 1.5f, "1.5"},
+    {"2X", 2.0f, "2.0"}, {"3X", 3.0f, "3.0"}, {"4X", 4.0f, "4.0"}}};
 struct BloomChoice {
     const char *name;
     const char *value;
@@ -137,11 +152,6 @@ std::string multiplier_text(std::uint32_t value) {
 }
 
 Option g_options[] = {
-    {"FEX_FUL", "FULLSCREEN", 2u,
-     [](const Config &c) { return c.display.fullscreen ? 1u : 0u; },
-     bool_text,
-     [](std::uint32_t i) { return lcs_save_config_value("Display", "Fullscreen", bool_value(i)); },
-     0u, 0u},
     {"FEX_RES", "RESOLUTION", 6u,
      [](const Config &c) {
          const InternalResolutionDimensions dims = resolve_internal_resolution(c.rendering);
@@ -190,6 +200,21 @@ Option g_options[] = {
      [](std::uint32_t i) { return std::string(kBloomModes[i].name); },
      [](std::uint32_t i) { return lcs_save_config_value("Rendering", "Bloom", kBloomModes[i].value); },
      0u, 0u},
+    {"FEX_LOD", "LOD DISTANCE", static_cast<std::uint32_t>(kLodChoices.size()),
+     [](const Config &c) {
+         std::uint32_t best = 0u;
+         for (std::uint32_t i = 1u; i < kLodChoices.size(); ++i)
+             if (std::abs(kLodChoices[i].scale - c.rendering.lod_scale) <
+                 std::abs(kLodChoices[best].scale - c.rendering.lod_scale))
+                 best = i;
+         return best;
+     },
+     [](std::uint32_t i) { return std::string(kLodChoices[i].name); },
+     [](std::uint32_t i) { return lcs_save_config_value("Rendering", "LodScale", kLodChoices[i].value); },
+     0u, 0u,
+     [](psprecomp::GuestMemory &memory, std::uint32_t i) {
+         (void)lcs_apply_lod_scale(memory, kLodChoices[i].scale);
+     }},
     {"FEX_UPS", "UPSCALE FILTER", static_cast<std::uint32_t>(kFilters.size()),
      [](const Config &c) {
          if (c.display.integer_scale) return 2u;
@@ -463,6 +488,23 @@ bool lcs_menu_option_step(psprecomp::GuestMemory &memory, std::uint32_t menu,
                                           : (option->pending_index + 1u) % count;
     if (!option->save(option->pending_index))
         std::cerr << "[menu] could not write " << option->label << " to the ini\n";
+    if (option->apply != nullptr) {
+        option->apply(memory, option->pending_index);
+        option->active_index = option->pending_index;  // already in effect: no restart needed
+    }
+    return true;
+}
+
+bool lcs_apply_lod_scale(psprecomp::GuestMemory &memory, float scale) noexcept {
+    static bool verified = false;
+    if (!memory.contains(kLodDistScaleAddress, 4u)) return false;
+    if (!verified) {
+        if (memory.load32(kLodDistScaleAddress) != kOneAsFloat) return false;
+        verified = true;
+    }
+    std::uint32_t bits = 0u;
+    std::memcpy(&bits, &scale, sizeof(bits));
+    memory.store32(kLodDistScaleAddress, bits);
     return true;
 }
 
