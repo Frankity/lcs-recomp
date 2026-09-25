@@ -233,9 +233,14 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.InternalScale must be between 1 and 8");
         return;
     }
-    if (key == "lodscale" || key == "loddistancescale" || key == "drawdistance") {
+    if (key == "lodscale" || key == "loddistancescale") {
         if (!parse_float(value, 0.25f, 8.0f, config.rendering.lod_scale))
             warning(config, line, "Rendering.LodScale must be between 0.25 and 8");
+        return;
+    }
+    if (key == "drawdistance" || key == "populationdistance") {
+        if (!parse_float(value, 0.5f, 4.0f, config.rendering.draw_distance))
+            warning(config, line, "Rendering.DrawDistance must be between 0.5 and 4");
         return;
     }
     if (key == "bloom") {

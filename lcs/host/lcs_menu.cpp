@@ -119,6 +119,13 @@ struct LodChoice {
 constexpr std::array<LodChoice, 6> kLodChoices{{
     {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"1.5X", 1.5f, "1.5"},
     {"2X", 2.0f, "2.0"}, {"3X", 3.0f, "3.0"}, {"4X", 4.0f, "4.0"}}};
+struct DrawDistanceChoice {
+    const char *name;
+    float scale;
+    const char *value;
+};
+constexpr std::array<DrawDistanceChoice, 5> kDrawDistanceChoices{{
+    {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"1.5X", 1.5f, "1.5"}, {"2X", 2.0f, "2.0"}, {"3X", 3.0f, "3.0"}}};
 struct BloomChoice {
     const char *name;
     const char *value;
@@ -132,7 +139,6 @@ struct FpsSize {
 constexpr std::array<FpsSize, 4> kFpsSizes{{
     {"TINY", 0.75f, "0.75"}, {"SMALL", 1.0f, "1.0"}, {"MEDIUM", 1.25f, "1.25"}, {"LARGE", 1.5f, "1.5"}}};
 
-std::string bool_text(std::uint32_t index) { return index != 0u ? "ON" : "OFF"; }
 std::string bool_value(std::uint32_t index) { return index != 0u ? "true" : "false"; }
 
 std::uint32_t nearest_index(const std::uint32_t *values, std::size_t count,
@@ -150,6 +156,8 @@ std::uint32_t nearest_index(const std::uint32_t *values, std::size_t count,
 std::string multiplier_text(std::uint32_t value) {
     return value <= 1u ? "OFF" : std::to_string(value) + "X";
 }
+
+float g_population_scale{1.0f};  // see lcs_population_distance_scale()
 
 Option g_options[] = {
     {"FEX_RES", "RESOLUTION", 6u,
@@ -215,6 +223,21 @@ Option g_options[] = {
      [](psprecomp::GuestMemory &memory, std::uint32_t i) {
          (void)lcs_apply_lod_scale(memory, kLodChoices[i].scale);
      }},
+    {"FEX_DST", "TRAFFIC DISTANCE", static_cast<std::uint32_t>(kDrawDistanceChoices.size()),
+     [](const Config &c) {
+         std::uint32_t best = 0u;
+         for (std::uint32_t i = 1u; i < kDrawDistanceChoices.size(); ++i)
+             if (std::abs(kDrawDistanceChoices[i].scale - c.rendering.draw_distance) <
+                 std::abs(kDrawDistanceChoices[best].scale - c.rendering.draw_distance))
+                 best = i;
+         return best;
+     },
+     [](std::uint32_t i) { return std::string(kDrawDistanceChoices[i].name); },
+     [](std::uint32_t i) {
+         return lcs_save_config_value("Rendering", "DrawDistance", kDrawDistanceChoices[i].value);
+     },
+     0u, 0u,
+     [](psprecomp::GuestMemory &, std::uint32_t i) { g_population_scale = kDrawDistanceChoices[i].scale; }},
     {"FEX_UPS", "UPSCALE FILTER", static_cast<std::uint32_t>(kFilters.size()),
      [](const Config &c) {
          if (c.display.integer_scale) return 2u;
@@ -277,7 +300,7 @@ Option g_options[] = {
      0u, 0u},
 };
 constexpr std::uint32_t kOptionCount = sizeof(g_options) / sizeof(g_options[0]);
-static_assert(kFirstOptionItem + kOptionCount <= 14u, "the last item slot must stay empty");
+static_assert(kFirstOptionItem + kOptionCount <= 15u, "a screen holds 15 items");
 
 std::uint32_t g_scratch{};
 std::uint32_t g_menu{};
@@ -345,9 +368,18 @@ static void install_display_options(psprecomp::GuestMemory &memory) {
             return;
         }
     }
+    // With every slot used, the game ends the list by reading the first two bytes of the next
+    // screen's name (the language page, unused here) as an empty action, so those are cleared.
+    const bool uses_last_slot = kFirstOptionItem + kOptionCount >= 15u;
     bool free_slots = memory.load16(hud) != 0u;
-    for (std::uint32_t i = 0u; i < kOptionCount + 1u; ++i)
+    for (std::uint32_t i = 0u; i < kOptionCount + (uses_last_slot ? 0u : 1u); ++i)
         free_slots = free_slots && memory.load16(item_base(kDisplayScreen, kHudItem + 1u + i)) == 0u;
+    if (uses_last_slot) {
+        const std::uint32_t next = screen_base(kDisplayScreen + 1u);
+        const char language[] = "FEH_LAN";
+        for (std::uint32_t i = 0u; i < sizeof(language); ++i)
+            free_slots = free_slots && memory.load8(next + i) == static_cast<std::uint8_t>(language[i]);
+    }
     if (!free_slots) {
         std::cerr << "[menu] Display screen layout differs; extra rows disabled\n";
         return;
@@ -372,6 +404,7 @@ static void install_display_options(psprecomp::GuestMemory &memory) {
 
     for (const ActionTable &table : kActionTables)
         memory.store32(table.base + 4u * (kOptionAction - table.bias), table.target);
+    if (uses_last_slot) memory.store16(screen_base(kDisplayScreen + 1u), 0u);
 }
 
 // Adds the QUIT tab: a copy of the tab table with a ninth entry, a QUIT page built on a blank
@@ -433,6 +466,7 @@ static void install_quit_tab(psprecomp::GuestMemory &memory, std::uint32_t scrat
 }
 
 void lcs_menu_install(psprecomp::GuestMemory &memory, std::uint32_t scratch_address) {
+    g_population_scale = lcs_render_configuration().rendering.draw_distance;
     g_scratch = scratch_address;
     install_display_options(memory);
     install_quit_tab(memory, scratch_address);
@@ -494,6 +528,8 @@ bool lcs_menu_option_step(psprecomp::GuestMemory &memory, std::uint32_t menu,
     }
     return true;
 }
+
+float lcs_population_distance_scale() noexcept { return g_population_scale; }
 
 bool lcs_apply_lod_scale(psprecomp::GuestMemory &memory, float scale) noexcept {
     static bool verified = false;

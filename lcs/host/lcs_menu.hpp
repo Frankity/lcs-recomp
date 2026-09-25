@@ -48,6 +48,10 @@ void lcs_menu_install(psprecomp::GuestMemory &memory, std::uint32_t scratch_addr
 // lcs_menu.cpp). Returns false when the game's constant is not where it is expected.
 [[nodiscard]] bool lcs_apply_lod_scale(psprecomp::GuestMemory &memory, float scale) noexcept;
 
+// Factor the generated camera code multiplies the pedestrian/car generation distance by (1.0 = the
+// game's own distance). Set from Rendering.DrawDistance and changed live by the menu row.
+[[nodiscard]] float lcs_population_distance_scale() noexcept;
+
 // Called once per frame: scrolls the Display list so the selected row stays visible.
 void lcs_menu_tick(psprecomp::GuestMemory &memory) noexcept;
 

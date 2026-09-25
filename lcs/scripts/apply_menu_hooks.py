@@ -15,6 +15,7 @@ Hooks (unit -> what they call):
   0182  Cross on YES            lcs_menu_quit_press      closes the game
   0183  value text              lcs_menu_value_text
   0183  tab bar drawing         lcs_menu_tab_table, lcs_menu_tab_count
+  0063  camera update           lcs_population_distance_scale  (ped/car generation distance)
 """
 import os
 
@@ -78,4 +79,12 @@ edit('generated_unit_0183.cpp', [
     ('ctx.gpr[4] = (static_cast<std::int32_t>(ctx.gpr[19]) < 8 ? 1u : 0u);',
      'ctx.gpr[4] = (static_cast<std::int32_t>(ctx.gpr[19]) < lcs::lcs_menu_tab_count() ? 1u : 0u);', 1),
 ])
+# camera update: the copy of the LOD factor the game keeps as the ped/car generation distance factor
+edit('generated_unit_0063.cpp', [(
+    '''    aot_mem.aot_store32(ctx.gpr[16] + static_cast<std::uint32_t>(228), std::bit_cast<std::uint32_t>(ctx.fpr[12]));
+    ctx.gpr[4] = (2229u << 16u);
+    ctx.fpr[13] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[4] + static_cast<std::uint32_t>(26512)));''',
+    '''    aot_mem.aot_store32(ctx.gpr[16] + static_cast<std::uint32_t>(228), std::bit_cast<std::uint32_t>(ctx.fpr[12] * lcs::lcs_population_distance_scale()));
+    ctx.gpr[4] = (2229u << 16u);
+    ctx.fpr[13] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[4] + static_cast<std::uint32_t>(26512)));''', 1)])
 print('generated hooks applied')
