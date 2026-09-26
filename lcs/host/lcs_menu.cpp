@@ -749,6 +749,10 @@ bool lcs_menu_tab_screen(psprecomp::GuestMemory &memory, std::uint32_t menu) noe
     return true;
 }
 
+bool lcs_menu_is_quit_screen(std::uint32_t screen) noexcept {
+    return g_tab_table != 0u && screen == kQuitScreen;
+}
+
 bool lcs_menu_quit_press(psprecomp::GuestMemory &memory, std::uint32_t menu) noexcept {
     if (g_tab_table == 0u || !memory.contains(menu, kMenuItemField + 4u)) return false;
     if (memory.load32(menu + kMenuScreenField) != kQuitScreen) return false;
