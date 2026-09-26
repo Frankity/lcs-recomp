@@ -23,4 +23,8 @@ struct AdhocHooks {
 
 void install_adhoc_hle(psprecomp::Runtime &runtime, const AdhocHooks &hooks);
 
+// Trace point called from the generated code (see scripts/apply_net_trace_hooks.py). Logs what the
+// game's multiplayer code is doing, only while the network emulation is running.
+void lcs_net_trace(psprecomp::GuestMemory &memory, psprecomp::AllegrexContext &ctx, std::uint32_t label);
+
 }  // namespace lcs

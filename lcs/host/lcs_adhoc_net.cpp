@@ -38,7 +38,7 @@ constexpr std::uintptr_t kNoSocket = ~std::uintptr_t{0};
 constexpr int kPortSpan = 8;  // ports tried / probed around the configured one
 constexpr std::size_t kMaxPtpBuffer = 1u << 20;
 
-enum FrameType : std::uint8_t { kFramePresence = 1, kFrameMatch = 2, kFramePdp = 3 };
+enum FrameType : std::uint8_t { kFramePresence = 1, kFrameMatch = 2, kFramePdp = 3, kFrameProbe = 4 };
 enum MatchSub : std::uint8_t {
     kSubHello = 1,
     kSubRequest = 2,
@@ -50,10 +50,7 @@ enum MatchSub : std::uint8_t {
     kSubPing = 8,
 };
 
-bool net_diag() {
-    static const bool enabled = std::getenv("LCS_NET_DIAG") != nullptr;
-    return enabled;
-}
+std::uint16_t g_log_port = 0;
 
 std::string mac_text(const Mac &mac) {
     char text[24];
@@ -100,6 +97,29 @@ std::string trim(const std::string &text) {
 
 }  // namespace
 
+void net_log(const std::string &line) {
+    static int lines = 0;
+    static std::FILE *file = nullptr;
+    static const bool to_console = std::getenv("LCS_NET_DIAG") != nullptr;
+    if (lines >= 20000) return;
+    ++lines;
+    if (file == nullptr && g_log_port != 0) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "LCSNative_net_%u.log", static_cast<unsigned>(g_log_port));
+        file = std::fopen(name, "w");
+    }
+    const auto ms = static_cast<unsigned long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count() % 1000000ull);
+    if (file != nullptr) {
+        std::fprintf(file, "%8llu %s\n", ms, line.c_str());
+        std::fflush(file);
+    }
+    if (to_console) std::cerr << line << '\n';
+}
+
+std::string net_mac_text(const Mac &mac) { return mac_text(mac); }
+
 std::uint64_t AdhocNet::now_ms() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                           std::chrono::steady_clock::now().time_since_epoch())
@@ -138,12 +158,13 @@ bool AdhocNet::start(const AdhocNetConfig &config) {
         address.sin_port = htons(static_cast<u_short>(config.port + offset));
         if (bind(as_socket(udp_socket_), reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0) {
             udp_port_ = static_cast<std::uint16_t>(config.port + offset);
+            g_log_port = udp_port_;
             bound = true;
         }
     }
     if (!bound) {
         close_socket(udp_socket_);
-        std::cerr << "[net] could not bind a UDP port near " << config.port << "\n";
+        NETLOG("could not bind a UDP port near " << config.port);
         return false;
     }
 
@@ -162,7 +183,7 @@ bool AdhocNet::start(const AdhocNetConfig &config) {
         address.sin_port = htons(tcp_port_);
         if (bind(as_socket(tcp_listener_), reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
             listen(as_socket(tcp_listener_), 16) != 0) {
-            std::cerr << "[net] could not listen on TCP port " << tcp_port_ << "\n";
+            NETLOG("could not listen on TCP port " << tcp_port_);
             close_socket(tcp_listener_);
         } else {
             make_nonblocking(as_socket(tcp_listener_));
@@ -190,14 +211,13 @@ bool AdhocNet::start(const AdhocNetConfig &config) {
             configured_peers_.emplace_back(address->sin_addr.s_addr, port);
             freeaddrinfo(found);
         } else {
-            std::cerr << "[net] cannot resolve multiplayer peer '" << item << "'\n";
+            NETLOG("cannot resolve multiplayer peer '" << item << "'");
         }
     }
 
     running_ = true;
     last_presence_ms_ = 0u;
-    std::cerr << "[net] ad-hoc emulation up: mac " << mac_text(mac_) << " udp " << udp_port_ << " tcp "
-              << tcp_port_ << " peers " << configured_peers_.size() << "\n";
+    NETLOG("ad-hoc emulation up: mac " << mac_text(mac_) << " udp " << udp_port_ << " tcp " << tcp_port_ << " peers " << configured_peers_.size());
     return true;
 }
 
@@ -298,6 +318,8 @@ void AdhocNet::handle_frame(std::uint8_t type, const Mac &source, const Mac &des
         endpoint.group.assign(reinterpret_cast<const char *>(payload), strnlen(reinterpret_cast<const char *>(payload), 8u));
         endpoint.nickname.assign(reinterpret_cast<const char *>(payload + 8),
                                  strnlen(reinterpret_cast<const char *>(payload + 8), 24u));
+    } else if (type == kFrameProbe) {
+        last_presence_ms_ = 0u;  // announce our group on the next poll
     } else if (type == kFrameMatch) {
         handle_match(source, payload, length);
     } else if (type == kFramePdp && length >= 4u) {
@@ -322,20 +344,22 @@ void AdhocNet::handle_frame(std::uint8_t type, const Mac &source, const Mac &des
 void AdhocNet::ctl_connect(const std::string &group) {
     group_ = group.substr(0u, 8u);
     last_presence_ms_ = 0u;  // announce right away
-    ctl_events_.emplace_back(now_ms() + 150u, CtlEvent{kCtlConnected, 0});
-    if (net_diag()) std::cerr << "[net] ctl connect group '" << group_ << "'\n";
+    ctl_events_.emplace_back(now_ms() + 15u, CtlEvent{kCtlConnected, 0});
+    NETLOG("ctl connect group '" << group_ << "'");
 }
 
 void AdhocNet::ctl_disconnect() {
     group_.clear();
     last_presence_ms_ = 0u;
-    ctl_events_.emplace_back(now_ms() + 50u, CtlEvent{kCtlDisconnected, 0});
-    if (net_diag()) std::cerr << "[net] ctl disconnect\n";
+    ctl_events_.emplace_back(now_ms() + 10u, CtlEvent{kCtlDisconnected, 0});
+    NETLOG("ctl disconnect");
 }
 
 void AdhocNet::ctl_scan() {
-    ctl_events_.emplace_back(now_ms() + 1200u, CtlEvent{kCtlScan, 0});
-    if (net_diag()) std::cerr << "[net] ctl scan\n";
+    // Ask everyone to announce their group right away, then give the answers a moment to arrive.
+    send_frame(kFrameProbe, kBroadcastMac, {});
+    ctl_events_.emplace_back(now_ms() + 120u, CtlEvent{kCtlScan, 0});
+    NETLOG("ctl scan");
 }
 
 std::vector<ScanEntry> AdhocNet::scan_results() const {
@@ -359,6 +383,12 @@ std::optional<std::string> AdhocNet::peer_name(const Mac &mac) const {
 bool AdhocNet::pop_ctl_event(CtlEvent &out) {
     if (ctl_events_.empty() || ctl_events_.front().first > now_ms()) return false;
     out = ctl_events_.front().second;
+    if (out.event == kCtlScan) {
+        const auto found = scan_results();
+        std::string names;
+        for (const ScanEntry &entry : found) names += " '" + entry.name + "'";
+        NETLOG("scan finished, groups seen:" << (names.empty() ? " none" : names));
+    }
     ctl_events_.pop_front();
     return true;
 }
@@ -374,9 +404,7 @@ std::int32_t AdhocNet::match_create(const MatchSettings &settings) {
     MatchContext context;
     context.id = next_match_id_++;
     context.settings = settings;
-    if (net_diag())
-        std::cerr << "[net] match create id " << context.id << " mode " << settings.mode << " port "
-                  << settings.port << " max " << settings.max_peers << "\n";
+    NETLOG("match create id " << context.id << " mode " << settings.mode << " port " << settings.port << " max " << settings.max_peers);
     const std::int32_t id = context.id;
     match_contexts_[id] = std::move(context);
     return id;
@@ -388,7 +416,7 @@ std::uint32_t AdhocNet::match_start(std::int32_t id, std::vector<std::uint8_t> h
     context->started = true;
     context->hello_opt = std::move(hello_opt);
     context->last_hello_ms = 0u;
-    if (net_diag()) std::cerr << "[net] match start id " << id << " opt " << context->hello_opt.size() << "\n";
+    NETLOG("match start id " << id << " opt " << context->hello_opt.size());
     return 0u;
 }
 
@@ -401,7 +429,7 @@ std::uint32_t AdhocNet::match_stop(std::int32_t id) {
             send_match(*context, mac, peer.state == 2 ? kSubCancel : (host_only ? kSubBye : kSubLeave), {});
     context->peers.clear();
     context->started = false;
-    if (net_diag()) std::cerr << "[net] match stop id " << id << "\n";
+    NETLOG("match stop id " << id);
     return 0u;
 }
 
@@ -438,9 +466,7 @@ void AdhocNet::queue_match_event(const MatchContext &context, std::int32_t event
     queued.event = event;
     queued.mac = mac;
     queued.opt = std::move(opt);
-    if (net_diag())
-        std::cerr << "[net] match event ctx " << context.id << " event " << event << " from " << mac_text(mac)
-                  << " opt " << queued.opt.size() << "\n";
+    NETLOG("match event ctx " << context.id << " event " << event << " from " << mac_text(mac) << " opt " << queued.opt.size());
     match_events_.push_back(std::move(queued));
 }
 
@@ -449,6 +475,7 @@ std::uint32_t AdhocNet::match_select(std::int32_t id, const Mac &target, std::ve
     if (context == nullptr) return kMatchingErrInvalidId;
     MatchPeer &peer = context->peers[target];
     const std::uint64_t now = now_ms();
+    NETLOG("match select ctx " << id << " target " << mac_text(target) << " (peer state " << peer.state << ")");
     if (peer.state == 1) {  // accepting a request that came in
         send_match(*context, target, kSubAccept, opt);
         peer.state = 3;
@@ -469,6 +496,7 @@ std::uint32_t AdhocNet::match_cancel(std::int32_t id, const Mac &target, std::ve
     const auto found = context->peers.find(target);
     if (found == context->peers.end()) return 0u;
     const int state = found->second.state;
+    NETLOG("match cancel ctx " << id << " target " << mac_text(target) << " (peer state " << state << ")");
     if (state == 1) send_match(*context, target, kSubDeny, opt);
     else if (state == 2) send_match(*context, target, kSubCancel, opt);
     else if (state == 3) send_match(*context, target, context->settings.mode == 1 ? kSubBye : kSubLeave, opt);
@@ -482,6 +510,8 @@ void AdhocNet::handle_match(const Mac &source, const std::uint8_t *payload, std:
     const std::uint8_t sub = payload[2];
     std::vector<std::uint8_t> opt(payload + 4, payload + length);
     const std::uint64_t now = now_ms();
+    if (sub != kSubHello && sub != kSubPing)
+        NETLOG("match message " << static_cast<int>(sub) << " from " << mac_text(source) << " port " << port);
 
     for (auto &[id, context] : match_contexts_) {
         if (!context.started || context.settings.port != port) continue;
@@ -611,7 +641,7 @@ std::uint32_t AdhocNet::pdp_create(std::uint16_t port, std::uint32_t buffer_size
     socket.buffer_size = buffer_size;
     const std::uint32_t id = socket.id;
     pdp_sockets_[id] = std::move(socket);
-    if (net_diag()) std::cerr << "[net] pdp create id " << id << " port " << port << "\n";
+    NETLOG("pdp create id " << id << " port " << port);
     return id;
 }
 
@@ -630,6 +660,8 @@ std::uint32_t AdhocNet::pdp_send(std::uint32_t id, const Mac &destination, std::
     put16(payload, port);
     payload.insert(payload.end(), data, data + length);
     send_frame(kFramePdp, destination, payload);
+    static int traced = 0;
+    if (traced++ < 40) NETLOG("pdp send id " << id << " " << length << " bytes to " << mac_text(destination) << ":" << port);
     return 0u;
 }
 
@@ -639,6 +671,8 @@ std::uint32_t AdhocNet::pdp_recv(std::uint32_t id, PdpPacket &out) {
     if (found->second.queue.empty()) return kAdhocErrWouldBlock;
     out = std::move(found->second.queue.front());
     found->second.queue.pop_front();
+    static int traced = 0;
+    if (traced++ < 40) NETLOG("pdp recv id " << id << " " << out.data.size() << " bytes from " << mac_text(out.mac) << ":" << out.port);
     found->second.queued_bytes -= std::min(found->second.queued_bytes, out.data.size());
     return 0u;
 }
@@ -670,8 +704,7 @@ std::uint32_t AdhocNet::ptp_open(std::uint16_t source_port, const Mac &destinati
     socket.destination_port = destination_port;
     const std::uint32_t id = socket.id;
     ptp_sockets_[id] = std::move(socket);
-    if (net_diag())
-        std::cerr << "[net] ptp open id " << id << " -> " << mac_text(destination) << ":" << destination_port << "\n";
+    NETLOG("ptp open id " << id << " -> " << mac_text(destination) << ":" << destination_port);
     return id;
 }
 
@@ -685,7 +718,7 @@ std::uint32_t AdhocNet::ptp_listen(std::uint16_t source_port) {
     socket.source_port = source_port;
     const std::uint32_t id = socket.id;
     ptp_sockets_[id] = std::move(socket);
-    if (net_diag()) std::cerr << "[net] ptp listen id " << id << " port " << source_port << "\n";
+    NETLOG("ptp listen id " << id << " port " << source_port);
     return id;
 }
 
@@ -743,7 +776,7 @@ std::uint32_t AdhocNet::ptp_connect(std::uint32_t id) {
     put16(header, socket.destination_port);
     socket.tx.insert(socket.tx.begin(), header.begin(), header.end());
     socket.state = PtpState::Established;
-    if (net_diag()) std::cerr << "[net] ptp connected id " << id << "\n";
+    NETLOG("ptp connected id " << id);
     return 0u;
 }
 
@@ -767,7 +800,7 @@ std::uint32_t AdhocNet::ptp_accept(std::uint32_t id, std::uint32_t &new_id, Mac 
     peer = pending.mac;
     peer_port = pending.port;
     ptp_sockets_[new_id] = std::move(accepted);
-    if (net_diag()) std::cerr << "[net] ptp accepted id " << new_id << " from " << mac_text(peer) << "\n";
+    NETLOG("ptp accepted id " << new_id << " from " << mac_text(peer));
     return 0u;
 }
 
@@ -778,6 +811,7 @@ std::uint32_t AdhocNet::ptp_send(std::uint32_t id, const std::uint8_t *data, std
     if (socket.state != PtpState::Established) return kAdhocErrNotConnected;
     if (socket.tx.size() + length > kMaxPtpBuffer) return kAdhocErrWouldBlock;
     socket.tx.insert(socket.tx.end(), data, data + length);
+    NETLOG("ptp send id " << id << " " << length << " bytes");
     return 0u;
 }
 
@@ -797,6 +831,7 @@ std::uint32_t AdhocNet::ptp_recv(std::uint32_t id, std::uint8_t *out, std::uint3
     std::memcpy(out, socket.rx.data(), count);
     socket.rx.erase(socket.rx.begin(), socket.rx.begin() + static_cast<std::ptrdiff_t>(count));
     received = static_cast<std::uint32_t>(count);
+    NETLOG("ptp recv id " << id << " " << count << " bytes");
     return 0u;
 }
 
@@ -810,6 +845,8 @@ std::uint32_t AdhocNet::ptp_flush(std::uint32_t id) {
 std::uint32_t AdhocNet::ptp_close(std::uint32_t id) {
     const auto found = ptp_sockets_.find(id);
     if (found == ptp_sockets_.end()) return kAdhocErrInvalidSocket;
+    NETLOG("ptp close id " << id << " (" << found->second.tx.size() << " bytes still unsent, " << found->second.rx.size()
+                            << " unread)");
     close_ptp_socket(found->second);
     ptp_sockets_.erase(found);
     return 0u;

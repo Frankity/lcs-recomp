@@ -94,9 +94,42 @@ std::string read_group(psprecomp::Runtime &rt, std::uint32_t address) {
 
 // ------------------------------------------------------------------------------ event thread
 
+// Debug aid: logs the game's own connection state when it changes. The addresses are objects of the
+// game's networking layer (image address + 0x08804000): the adhoc connection (flags, error, state)
+// and the multiplayer session.
+void watch_game_state(psprecomp::Runtime &rt) {
+    constexpr std::uint32_t kAdhocPointer = 0x08B5AE3Cu, kSessionPointer = 0x08B816CCu, kSessionConnected = 0x08B81749u,
+                            kSuspended = 0x08B816F4u, kGameActive = 0x08B56B3Cu;
+    static std::vector<std::uint32_t> last;
+    if (!rt.memory().contains(kAdhocPointer, 4u)) return;
+    std::vector<std::uint32_t> now;
+    const std::uint32_t adhoc = rt.memory().load32(kAdhocPointer);
+    if (adhoc != 0u && rt.memory().contains(adhoc, 0x60u)) {
+        now = {adhoc, rt.memory().load8(adhoc + 0x0Cu), rt.memory().load8(adhoc + 0x3Cu), rt.memory().load32(adhoc + 0x40u),
+               rt.memory().load32(adhoc + 0x44u), rt.memory().load32(adhoc + 0x14u)};
+    } else {
+        now = {adhoc};
+    }
+    now.push_back(rt.memory().load32(kSessionPointer));
+    now.push_back(rt.memory().load8(kSessionConnected));
+    now.push_back(rt.memory().load8(kSuspended));
+    now.push_back(rt.memory().load8(kGameActive));
+    if (now == last) return;
+    last = now;
+    std::string text;
+    static const char *names[] = {"adhoc", "host", "err", "result", "flags", "state", "session", "connected", "suspended", "active"};
+    for (std::size_t i = 0; i < now.size() && i < std::size(names); ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s=%x", names[i], now[i]);
+        text += item;
+    }
+    NETLOG("game state:" << text);
+}
+
 void poller_entry(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
     State &s = state();
     s.net.poll();
+    watch_game_state(rt);
 
     CtlEvent ctl;
     while (s.net.pop_ctl_event(ctl)) {
@@ -108,7 +141,7 @@ void poller_entry(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             call.args[2] = handler.argument;
             s.calls.push_back(std::move(call));
         }
-        if (diag()) std::cerr << "[net] ctl event " << ctl.event << " -> " << s.handlers.size() << " handlers\n";
+        NETLOG("ctl event " << ctl.event << " -> " << s.handlers.size() << " handlers");
     }
     MatchEvent match;
     while (s.net.pop_match_event(match)) {
@@ -167,7 +200,7 @@ bool ensure_started(psprecomp::Runtime &rt, const psprecomp::AllegrexContext &ct
         rt.register_function(kPollerEntry, &poller_entry, "lcs_net_event_thread");
         const std::int32_t uid = s.hooks.spawn_native_thread(rt, ctx, "NetEventThread", kPollerEntry, 0x18u,
                                                              kPollerStack, s.poller_stack);
-        if (uid < 0) std::cerr << "[net] could not create the network event thread\n";
+        if (uid < 0) NETLOG("could not create the network event thread");
     }
     return true;
 }
@@ -201,6 +234,8 @@ bool wait_or_fail(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx, std::
 void finish(std::uint32_t result, psprecomp::AllegrexContext &ctx) {
     state().blocked.erase(state().hooks.current_thread());
     ctx.set_gpr(2, result);
+    if ((result & 0x80000000u) != 0u && result != kAdhocErrWouldBlock)
+        NETLOG("call failed with 0x" << std::hex << result << std::dec << " (a0=" << ctx.gpr[4] << ")");
 }
 
 // Result handling shared by the calls that may have to wait.
@@ -212,6 +247,86 @@ bool settle(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx, std::uint32
 }
 
 }  // namespace
+
+// While a multiplayer game starts, the host waits for the other players with a timer of 10.0 that
+// grows by 0.5 every time the game's update runs. That update runs about 40 times in 12 ms here (the
+// game does not wait for the display in this phase), so the wait ended almost at once and the host
+// gave up before anyone could join. Called just before every update of the wait: keep the timer to
+// the real time (units of seconds) so the wait lasts the ten seconds it is meant to.
+void limit_player_wait(psprecomp::GuestMemory &memory) {
+    constexpr std::uint32_t kWaitTimer = 0x08B81668u + 0xE8u;
+    static std::uint64_t started_ms = 0u;
+    static std::uint64_t last_call_ms = 0u;
+    const std::uint64_t now = AdhocNet::now_ms();
+    const std::uint32_t bits = memory.load32(kWaitTimer);
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    if (started_ms == 0u || (value == 0.0f && now - last_call_ms > 2000u)) started_ms = now;  // a new wait
+    last_call_ms = now;
+    const float allowed = static_cast<float>(now - started_ms) / 1000.0f;
+    if (value > allowed) {
+        std::uint32_t clamped;
+        std::memcpy(&clamped, &allowed, sizeof(clamped));
+        memory.store32(kWaitTimer, clamped);
+    }
+}
+
+// Once a multiplayer game is open, each side checks every frame that it has heard from the others:
+// during the first 10000 ms of the game's clock nothing is checked, afterwards a peer that never
+// answered ends the game ("I haven't heard from the server"). Loading runs far faster than it did
+// on the PSP here, and the game's clock ran ahead of real time, so those 10 s were over almost at
+// once. Keep the time since the game was opened at or below the real time since it was opened.
+// `game` is the multiplayer object (the argument of the check).
+void keep_open_time_real(psprecomp::GuestMemory &memory, std::uint32_t game) {
+    constexpr std::uint32_t kGameClock = 0x08B5E02Cu;  // the game's millisecond clock
+    constexpr std::uint32_t kOpenedAt = 0x88u;           // clock value when the game was opened
+    if (game == 0u || !memory.contains(game, kOpenedAt + 4u)) return;
+    static std::uint32_t expected_open_time = 0u;
+    static std::uint64_t real_start_ms = 0u;
+    static int traced = 0;
+    const std::uint64_t now = AdhocNet::now_ms();
+    const std::uint32_t game_now = memory.load32(kGameClock);
+    const std::uint32_t opened_at = memory.load32(game + kOpenedAt);
+    if (opened_at != expected_open_time) {  // a newly opened game
+        expected_open_time = opened_at;
+        real_start_ms = now;
+    }
+    const std::uint32_t game_elapsed = game_now - opened_at;
+    const std::uint64_t real_elapsed = now - real_start_ms;
+    if (traced++ < 6 || game_elapsed > real_elapsed + 500u)
+        if (traced < 200) NETLOG("open time: game clock advanced " << game_elapsed << " ms, real time " << real_elapsed << " ms");
+    if (game_elapsed > real_elapsed) {
+        expected_open_time = game_now - static_cast<std::uint32_t>(real_elapsed);
+        memory.store32(game + kOpenedAt, expected_open_time);
+    }
+}
+
+void lcs_net_trace(psprecomp::GuestMemory &memory, psprecomp::AllegrexContext &ctx, std::uint32_t label) {
+    State &s = state();
+    if (!s.started) return;
+    if (label == 0x08AD1258u) {
+        NETLOG("TRACE connection error handler entered, return address 0x" << std::hex << ctx.gpr[31] << " a0=" << ctx.gpr[4]
+                                                                          << " a1=" << ctx.gpr[5] << std::dec);
+        return;
+    }
+    if (label == 0x088AF290u) {
+        keep_open_time_real(memory, ctx.gpr[4]);
+        return;
+    }
+    if (label == 0x08A0A6C0u) {
+        NETLOG("TRACE adhoc error reported, return address 0x" << std::hex << ctx.gpr[31] << std::dec);
+        return;
+    }
+    // The other points are printf-like debug functions: a0 is the format string.
+    const std::uint32_t text = ctx.gpr[4];
+    if (text != 0u && memory.contains(text, 4u)) {
+        std::string line = memory.read_c_string(text, 160u);
+        if (label == 0x08AD0690u && line.rfind("MultiGame not connected", 0) == 0) limit_player_wait(memory);
+        if (line.rfind("Removing Model", 0) == 0 || line.rfind("MultiGame not open", 0) == 0) return;
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        NETLOG("GAME: " << line << "  (args 0x" << std::hex << ctx.gpr[5] << " 0x" << ctx.gpr[6] << std::dec << ")");
+    }
+}
 
 void install_adhoc_hle(psprecomp::Runtime &runtime, const AdhocHooks &hooks) {
     State &s = state();
@@ -385,7 +500,11 @@ void install_adhoc_hle(psprecomp::Runtime &runtime, const AdhocHooks &hooks) {
     });
     runtime.register_hle("sceNetAdhocctl", 0x8916C003u, [](Rt &rt, Ctx &ctx) {  // GetNameByAddr(mac*, nickname*)
         const auto name = state().net.peer_name(read_mac(rt, ctx.gpr[4]));
-        if (!name) { ctx.set_gpr(2, kAdhocErrNoEntry); return; }
+        if (!name) {
+            NETLOG("GetNameByAddr: " << net_mac_text(read_mac(rt, ctx.gpr[4])) << " is not in group '" << state().net.group() << "'");
+            ctx.set_gpr(2, kAdhocErrNoEntry);
+            return;
+        }
         std::vector<std::uint8_t> text(128u, 0u);
         std::memcpy(text.data(), name->data(), std::min<std::size_t>(name->size(), 127u));
         if (ctx.gpr[5] != 0u && rt.memory().contains(ctx.gpr[5], 128u)) rt.memory().copy_in(ctx.gpr[5], text);
@@ -409,6 +528,7 @@ void install_adhoc_hle(psprecomp::Runtime &runtime, const AdhocHooks &hooks) {
             write_mac(rt, entry + 16u, results[i].mac);
         }
         rt.memory().store32(size_pointer, count * kGetScanInfoEntry);
+        NETLOG("GetScanInfo returned " << count << " entries");
         ctx.set_gpr(2, 0u);
     });
 
@@ -427,7 +547,7 @@ void install_adhoc_hle(psprecomp::Runtime &runtime, const AdhocHooks &hooks) {
         settings.init_count = ctx.gpr[10];
         settings.msg_us = ctx.gpr[11];
         settings.callback = rt.memory().contains(ctx.gpr[29], 4u) ? rt.memory().load32(ctx.gpr[29]) : 0u;
-        if (diag()) std::cerr << "[net] MatchingCreate callback " << std::hex << settings.callback << std::dec << "\n";
+        NETLOG("MatchingCreate callback " << std::hex << settings.callback << std::dec);
         ctx.set_gpr(2, static_cast<std::uint32_t>(state().net.match_create(settings)));
     });
     // Start(id, event thread priority, stack, interrupt thread priority, stack, hello option length, hello option)
