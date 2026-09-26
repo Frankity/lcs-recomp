@@ -229,6 +229,7 @@ struct Dx12GeState {
     ComPtr<ID3DBlob> vertex_shader;
     ComPtr<ID3DBlob> packed_0115_vertex_shader;
     ComPtr<ID3DBlob> pixel_shader;
+    ComPtr<ID3DBlob> pixel_shader_a2c;  // alpha test written as coverage, for alpha-to-coverage draws
     std::unordered_map<std::uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
     std::unordered_map<std::uint64_t, Dx12Texture> textures;
     std::uint64_t last_texture_lookup_key{};
@@ -783,12 +784,21 @@ std::uint8_t color_write_mask(const GeGpuDrawDescriptor &draw) noexcept {
     return mask;
 }
 
+// Alpha-tested draws without blending (foliage, fences) get a soft edge from alpha-to-coverage
+// when MSAA is on. Only the "greater" and "greater or equal" tests are turned into coverage.
+bool alpha_to_coverage_draw(const GeGpuDrawDescriptor &draw) noexcept {
+    return draw.alpha_test_enabled && (draw.alpha_function == 6u || draw.alpha_function == 7u) &&
+           state().sample_count > 1u && lcs_render_configuration().rendering.alpha_to_coverage &&
+           !resolve_blend(draw).enabled;
+}
+
 std::uint64_t pipeline_key(const GeGpuDrawDescriptor &draw) noexcept {
     std::uint64_t key = static_cast<std::uint64_t>(draw.depth_test_enabled ? 1u : 0u);
     key |= static_cast<std::uint64_t>(draw.depth_write_enabled ? 1u : 0u) << 1u;
     key |= static_cast<std::uint64_t>(draw.depth_function & 7u) << 2u;
     key |= resolve_blend(draw).key() << 16u;
     key |= static_cast<std::uint64_t>(color_write_mask(draw) & 0xFu) << 8u;
+    key |= static_cast<std::uint64_t>(alpha_to_coverage_draw(draw) ? 1u : 0u) << 60u;
     return key;
 }
 
@@ -889,6 +899,9 @@ bool compile_shaders(Dx12GeState &s, std::string &error) noexcept {
     const char *shader = R"HLSL(
 #ifndef LCS_HDR
 #define LCS_HDR 0
+#endif
+#ifndef LCS_A2C
+#define LCS_A2C 0
 #endif
 // Colours are clamped to 0-1 like the PSP does; with LCS_HDR only the negative side and alpha are.
 float4 LcsColorClamp(float4 v) {
@@ -1107,9 +1120,22 @@ float4 PSMain(VSOut input) : SV_TARGET {
         color.rgb = lerp(fog, color.rgb, saturate(input.fogFactor));
     }
     if (alphaControl.x != 0u) {
+#if LCS_A2C
+        if (alphaControl.y >= 6u) {
+            // greater / greater or equal: the coverage ramps over about one pixel around the threshold
+            float threshold = ((float)(alphaControl.z & alphaControl.w) + (alphaControl.y == 6u ? 0.5 : -0.5)) / 255.0;
+            float width = max(fwidth(color.a), 1.0 / 255.0);
+            color.a = saturate((color.a - threshold) / width + 0.5);
+        } else {
+            uint a = (uint)floor(saturate(color.a) * 255.0 + 0.5);
+            uint mask = alphaControl.w;
+            if (!AlphaPass(alphaControl.y, a & mask, alphaControl.z & mask)) discard;
+        }
+#else
         uint a = (uint)floor(saturate(color.a) * 255.0 + 0.5);
         uint mask = alphaControl.w;
         if (!AlphaPass(alphaControl.y, a & mask, alphaControl.z & mask)) discard;
+#endif
     }
     return QuantizeFramebuffer(color, FramebufferFormat);
 }
@@ -1141,6 +1167,18 @@ float4 PSMain(VSOut input) : SV_TARGET {
         error = errors ? std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize())
                        : hr_text(hr, "D3DCompile(DX12 GE PS)");
         return false;
+    }
+    {
+        const D3D_SHADER_MACRO a2c_defines[] = {
+            {"LCS_HDR", lcs_render_configuration().rendering.hdr ? "1" : "0"}, {"LCS_A2C", "1"}, {nullptr, nullptr}};
+        errors.Reset();
+        hr = D3DCompile(shader, std::strlen(shader), "LCSNativeDX12GE", a2c_defines, nullptr,
+                        "PSMain", "ps_5_1", flags, 0u, &s.pixel_shader_a2c, &errors);
+        if (FAILED(hr)) {
+            error = errors ? std::string(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize())
+                           : hr_text(hr, "D3DCompile(DX12 GE PS alpha-to-coverage)");
+            return false;
+        }
     }
 
     const char *present = kGePresentShaderHlsl;
@@ -1499,7 +1537,9 @@ ComPtr<ID3D12PipelineState> create_pipeline(Dx12GeState &s,
     pso.pRootSignature = s.root_signature.Get();
     ID3DBlob *vs = packed_0115 ? s.packed_0115_vertex_shader.Get() : s.vertex_shader.Get();
     pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-    pso.PS = {s.pixel_shader->GetBufferPointer(), s.pixel_shader->GetBufferSize()};
+    const bool coverage = alpha_to_coverage_draw(draw);
+    ID3DBlob *ps = coverage ? s.pixel_shader_a2c.Get() : s.pixel_shader.Get();
+    pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
     pso.InputLayout = packed_0115
         ? D3D12_INPUT_LAYOUT_DESC{packed_layout, static_cast<UINT>(std::size(packed_layout))}
         : D3D12_INPUT_LAYOUT_DESC{layout, static_cast<UINT>(std::size(layout))};
@@ -1508,7 +1548,7 @@ ComPtr<ID3D12PipelineState> create_pipeline(Dx12GeState &s,
     pso.RasterizerState.CullMode = cull_enabled ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
     pso.RasterizerState.FrontCounterClockwise = accept_counter_clockwise ? FALSE : TRUE;
     pso.RasterizerState.DepthClipEnable = TRUE;
-    pso.BlendState.AlphaToCoverageEnable = FALSE;
+    pso.BlendState.AlphaToCoverageEnable = coverage ? TRUE : FALSE;
     pso.BlendState.IndependentBlendEnable = FALSE;
     D3D12_RENDER_TARGET_BLEND_DESC blend{};
     blend.RenderTargetWriteMask = color_write_mask(draw);
@@ -2547,6 +2587,7 @@ void destroy_backend(Dx12GeState &s) noexcept {
     s.known_frame_targets.clear();
     s.last_registered_framebuffer_target = 0xFFFFFFFFu;
     s.pixel_shader.Reset();
+    s.pixel_shader_a2c.Reset();
     s.packed_0115_vertex_shader.Reset();
     s.vertex_shader.Reset();
     s.root_signature.Reset();

@@ -259,6 +259,11 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.TextureScale expects Off or 2x");
         return;
     }
+    if (key == "alphatocoverage") {
+        if (!parse_bool(value, config.rendering.alpha_to_coverage))
+            warning(config, line, "Rendering.AlphaToCoverage expects true/false");
+        return;
+    }
     if (key == "hdr") {
         if (!parse_bool(value, config.rendering.hdr))
             warning(config, line, "Rendering.HDR expects true/false");
