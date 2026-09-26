@@ -3,6 +3,7 @@
 #include "lcs_profile.hpp"
 #include "display_window.hpp"
 #include "lcs_menu.hpp"
+#include "lcs_adhoc.hpp"
 #include "lcs_ge_exec.hpp"
 #include "lcs_sas.hpp"
 #include "ge_gpu_backend.hpp"
@@ -761,6 +762,11 @@ struct SavedataUtilityState {
     bool operation_complete{};
 };
 SavedataUtilityState savedata_utility{};
+// The message dialog (the game reports network problems with it) has no screen here: it opens,
+// "answers" OK and closes, walking through the same statuses as the real one.
+SavedataUtilityState msg_dialog_utility{};
+constexpr std::uint32_t kMsgDialogMessageOffset = 0x3Cu;
+constexpr std::uint32_t kMsgDialogButtonOffset = 0x240u;
 
 constexpr std::uint32_t kUtilityCommonResultOffset = 0x1Cu;
 constexpr std::uint32_t kSavedataModeOffset = 0x30u;
@@ -2405,6 +2411,65 @@ void dump_pc_profile() {
     }
 }
 
+// Hooks that give the network bindings (lcs_adhoc.cpp) access to the thread scheduler.
+std::int32_t adhoc_current_thread() { return thread_table.current_uid; }
+
+// Delays the running thread and resumes it at ctx.pc, whatever it currently is.
+bool adhoc_delay_at_pc(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx, std::uint32_t microseconds) {
+    check_wall_clock_limit(runtime, 0xFFu);
+    auto current = thread_table.threads.find(thread_table.current_uid);
+    if (current == thread_table.threads.end()) return true;
+    current->second.state = ThreadState::Delayed;
+    current->second.suspended_context = ctx;
+    current->second.delay_until_us = virtual_time_us + microseconds;
+    current->second.delay_sequence = thread_table.next_delay_sequence++;
+    if (!activate_next_thread(ctx, "net")) {
+        runtime.stop("PSP scheduler deadlock while waiting for the network");
+        return false;
+    }
+    return true;
+}
+
+// Creates and starts a thread whose entry point is a host function.
+std::int32_t adhoc_spawn_native_thread(psprecomp::Runtime &rt, const psprecomp::AllegrexContext &creator,
+                                       const char *name, std::uint32_t entry, std::uint32_t priority,
+                                       std::uint32_t stack_size, std::uint32_t &stack_bottom_out) {
+    std::uint32_t stack_bottom = 0u;
+    std::uint32_t stack_top = 0u;
+    if (!allocate_thread_stack(stack_size, stack_bottom, stack_top) || !rt.memory().contains(stack_bottom, stack_size))
+        return -1;
+    ThreadRecord record{name, entry, priority, stack_size, 0u};
+    const std::int32_t uid = thread_table.next_uid++;
+    record.stack_top = stack_top;
+    record.stack_bottom = stack_bottom;
+    record.kernel_context = stack_top - 0x100u;
+    rt.memory().zero(stack_bottom, stack_size);
+    rt.memory().store32(stack_bottom, static_cast<std::uint32_t>(uid));
+    rt.memory().store32(record.kernel_context + 0xC0u, static_cast<std::uint32_t>(uid));
+    rt.memory().store32(record.kernel_context + 0xC8u, stack_bottom);
+    rt.memory().store32(record.kernel_context + 0xF8u, 0xFFFFFFFFu);
+    rt.memory().store32(record.kernel_context + 0xFCu, 0xFFFFFFFFu);
+    const std::uint32_t sp = record.kernel_context - 64u;
+    const std::uint32_t kernel_context = record.kernel_context;
+    thread_table.threads.emplace(uid, std::move(record));
+
+    psprecomp::AllegrexContext next{};
+    next.set_gpr(26, kernel_context);
+    next.set_gpr(28, creator.gpr[28]);
+    next.set_gpr(29, sp);
+    next.set_gpr(30, sp);
+    next.set_gpr(31, 0u);
+    next.pc = entry;
+    enqueue_continuation(uid, next);
+    stack_bottom_out = stack_bottom;
+    return uid;
+}
+
+const AdhocHooks &adhoc_hooks() {
+    static const AdhocHooks hooks{&adhoc_current_thread, &adhoc_delay_at_pc, &adhoc_spawn_native_thread};
+    return hooks;
+}
+
 void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start) {
     thread_table = ThreadTable{};
 
@@ -2443,6 +2508,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     umd_callback_notified = false;
     general_purpose_io = 0u;
     savedata_utility = SavedataUtilityState{};
+    msg_dialog_utility = SavedataUtilityState{};
     ge_worker_stop();
     pending_ge_callbacks.clear();
     mpeg_contexts.clear();
@@ -4214,6 +4280,52 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             set_success(ctx);
         });
 
+    // sceUtilityMsgDialog: InitStart, Update, GetStatus, ShutdownStart
+    runtime.register_hle("sceUtility", 0x2AD8E239u,
+        [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+            const std::uint32_t parameter = ctx.gpr[4];
+            if (msg_dialog_utility.status != UtilityStatus::None) {
+                ctx.set_gpr(2, 0x80110001u);
+                return;
+            }
+            if (parameter == 0u || !rt.memory().contains(parameter, kMsgDialogButtonOffset + 4u)) {
+                ctx.set_gpr(2, 0x80110004u);
+                return;
+            }
+            msg_dialog_utility = SavedataUtilityState{UtilityStatus::Init, parameter, false};
+            rt.memory().store32(parameter + kUtilityCommonResultOffset, 0u);
+            rt.memory().store32(parameter + kMsgDialogButtonOffset, 1u);  // "Yes" / OK
+            if (std::getenv("LCS_NET_DIAG") != nullptr)
+                std::cerr << "[msgdialog] \"" << rt.memory().read_c_string(parameter + kMsgDialogMessageOffset, 200u) << "\"\n";
+            set_success(ctx);
+        });
+    runtime.register_hle("sceUtility", 0x95FC253Bu,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            if (msg_dialog_utility.status == UtilityStatus::None || msg_dialog_utility.status == UtilityStatus::Finished) {
+                ctx.set_gpr(2, 0x80110001u);
+                return;
+            }
+            if (msg_dialog_utility.status == UtilityStatus::Init) msg_dialog_utility.status = UtilityStatus::Visible;
+            else if (msg_dialog_utility.status == UtilityStatus::Visible) msg_dialog_utility.status = UtilityStatus::Quit;
+            set_success(ctx);
+        });
+    runtime.register_hle("sceUtility", 0x9A1C91D7u,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            const UtilityStatus reported = msg_dialog_utility.status;
+            ctx.set_gpr(2, static_cast<std::uint32_t>(reported));
+            if (reported == UtilityStatus::Init) msg_dialog_utility.status = UtilityStatus::Visible;
+            else if (reported == UtilityStatus::Finished) msg_dialog_utility = SavedataUtilityState{};
+        });
+    runtime.register_hle("sceUtility", 0x67AF3428u,
+        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+            if (msg_dialog_utility.status != UtilityStatus::Quit) {
+                ctx.set_gpr(2, 0x80110001u);
+                return;
+            }
+            msg_dialog_utility.status = UtilityStatus::Finished;
+            set_success(ctx);
+        });
+
     runtime.register_hle("sceUtility", 0xA5DA2406u,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
             const std::uint32_t id = ctx.gpr[4];
@@ -5258,8 +5370,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             set_success(ctx);
         });
 
-    runtime.register_hle("sceWlanDrv", 0xD7763699u,
-        [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) { ctx.set_gpr(2, 0u); });
+    install_adhoc_hle(runtime, adhoc_hooks());
 
     runtime.register_hle("UtilsForUser", 0x27CC57F0u,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {

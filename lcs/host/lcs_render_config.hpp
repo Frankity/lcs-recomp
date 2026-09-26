@@ -155,6 +155,15 @@ struct ControlsConfiguration {
     bool modern_control_scheme{false};
 };
 
+// The PSP multiplayer is ad-hoc Wi-Fi. It is emulated over UDP (discovery, lobby, datagrams) and
+// TCP (reliable streams) between copies of this game on the same network.
+struct MultiplayerConfiguration {
+    bool enabled{true};               // false: the WLAN switch reads as off and multiplayer stays unavailable
+    std::uint32_t port{27015u};       // UDP port; TCP uses port + 1000
+    std::string peers{};              // extra "address:port" endpoints, comma separated (other PC, or a second copy here)
+    std::string nickname{"Player"};   // name shown to the other players
+};
+
 struct LcsConfiguration {
     ControlsConfiguration controls{};
     DisplayConfiguration display{};
@@ -163,6 +172,7 @@ struct LcsConfiguration {
     TimingConfiguration timing{};
     DiagnosticsConfiguration diagnostics{};
     WidescreenConfiguration widescreen{};
+    MultiplayerConfiguration multiplayer{};
     std::filesystem::path source_path{};
     std::filesystem::path executable_directory{};
     bool initialized{true};
