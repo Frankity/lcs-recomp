@@ -99,6 +99,34 @@ Settings are in `lcs/config/LCSNative.ini` (the same file as on Windows).
 Build from a native Linux file system (ext4, btrfs…). Building from an NTFS drive with many
 parallel jobs has produced corrupted reads of source files.
 
+### Portable build (Steam Deck and any distribution)
+
+`lcs/portable/build_portable.sh` builds a self-contained package with Docker, inside the Steam
+Linux Runtime 3 "sniper" SDK (Debian 11, glibc 2.31):
+
+```text
+lcs/portable/build_portable.sh
+# -> out/lcs-portable/LCSNative-linux-x86_64.tar.gz
+```
+
+The package is a folder with `LCSNative`, `libSDL3.so.0`, `LCSNative.ini`, `play.sh`, a README
+and an empty `game/` folder. From the system it only needs **glibc 2.29+** and **`libvulkan.so.1`**:
+
+- libstdc++/libgcc, shaderc and a minimal FFmpeg (MPEG-PS + H.264 for the movies, WAV + ATRAC3+
+  for the audio) are linked into the executable (CMake option `LCS_PORTABLE=ON`).
+- SDL3 is built with `SDL_DEPS_SHARED`, so it loads X11, Wayland, libdecor, PipeWire, PulseAudio,
+  ALSA, D-Bus and udev only if they are present. The executable finds it through `RUNPATH=$ORIGIN`.
+- Glibc and the Vulkan loader stay dynamic on purpose: the loader has to load the system's GPU
+  driver, and a static glibc breaks `dlopen`.
+
+The first run builds the Docker image (FFmpeg, shaderc and SDL3 from source, a few minutes); later
+runs reuse it. The source tree is copied to `~/.cache/lcs-portable` (override with
+`LCS_PORTABLE_WORK`) because Docker cannot bind-mount FUSE/NTFS drives.
+
+On the Steam Deck: unpack the folder, copy the game files into `game/`, add `play.sh` to Steam as
+a non-Steam game from desktop mode, and use a lighter profile in `LCSNative.ini` (for example
+`InternalScale=2`, `MSAA=4`) for its 1280x800 screen.
+
 ### Troubleshooting
 
 - `LCS_VULKAN_VALIDATION=1` enables the Vulkan validation layers (slow). Install

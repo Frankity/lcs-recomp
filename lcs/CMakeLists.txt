@@ -42,9 +42,25 @@ if(WIN32)
 else()
     find_package(Vulkan REQUIRED)
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(LCS_DEPS REQUIRED IMPORTED_TARGET
-        sdl3 shaderc libavcodec libavformat libavutil libswresample libswscale)
-    target_link_libraries(LCSNative PRIVATE Vulkan::Vulkan PkgConfig::LCS_DEPS)
+    # Portable build (see portable/Dockerfile): libstdc++, shaderc and FFmpeg are linked
+    # statically and SDL3 is loaded from the executable's folder, so only glibc and the Vulkan
+    # loader come from the system.
+    option(LCS_PORTABLE "Self-contained Linux build" OFF)
+    if(LCS_PORTABLE)
+        pkg_check_modules(LCS_SDL3 REQUIRED IMPORTED_TARGET sdl3)
+        pkg_check_modules(LCS_FFMPEG REQUIRED libavformat libavcodec libswscale libswresample libavutil)
+        find_library(LCS_SHADERC_COMBINED NAMES libshaderc_combined.a REQUIRED)
+        find_path(LCS_SHADERC_INCLUDE shaderc/shaderc.h REQUIRED)
+        target_include_directories(LCSNative PRIVATE ${LCS_SHADERC_INCLUDE} ${LCS_FFMPEG_INCLUDE_DIRS})
+        target_link_libraries(LCSNative PRIVATE Vulkan::Vulkan PkgConfig::LCS_SDL3
+            ${LCS_SHADERC_COMBINED} ${LCS_FFMPEG_STATIC_LDFLAGS})
+        target_link_options(LCSNative PRIVATE -static-libstdc++ -static-libgcc)
+        set_target_properties(LCSNative PROPERTIES BUILD_RPATH "$ORIGIN")
+    else()
+        pkg_check_modules(LCS_DEPS REQUIRED IMPORTED_TARGET
+            sdl3 shaderc libavcodec libavformat libavutil libswresample libswscale)
+        target_link_libraries(LCSNative PRIVATE Vulkan::Vulkan PkgConfig::LCS_DEPS)
+    endif()
 endif()
 
 file(GLOB GENERATED_SOURCES CONFIGURE_DEPENDS generated/*.cpp)
