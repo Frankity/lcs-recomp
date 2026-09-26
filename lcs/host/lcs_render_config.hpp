@@ -40,7 +40,15 @@ enum class BloomMode : std::uint8_t {
 enum class RenderingBackend : std::uint8_t {
     Software,
     DirectX12,
+    Vulkan,
 };
+
+// The GPU backend this build has: DirectX 12 on Windows, Vulkan elsewhere.
+#if defined(_WIN32)
+inline constexpr RenderingBackend kPlatformGpuBackend = RenderingBackend::DirectX12;
+#else
+inline constexpr RenderingBackend kPlatformGpuBackend = RenderingBackend::Vulkan;
+#endif
 
 struct DisplayConfiguration {
     bool enabled{true};
@@ -82,7 +90,7 @@ struct InternalResolutionDimensions {
 };
 
 struct RenderingConfiguration {
-    RenderingBackend backend{RenderingBackend::DirectX12};
+    RenderingBackend backend{kPlatformGpuBackend};
     InternalResolutionMode internal_resolution_mode{InternalResolutionMode::PspNative};
     std::uint32_t internal_scale{2u};
     std::uint32_t internal_width{960u};

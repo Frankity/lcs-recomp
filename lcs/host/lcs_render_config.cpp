@@ -208,10 +208,12 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
                          const std::string &value, std::size_t line) {
     if (key == "backend" || key == "renderingbackend") {
         const std::string backend = lowercase_copy(trim_copy(value));
-        if (backend == "directx12" || backend == "dx12" || backend == "d3d12" || backend == "gpu")
-            config.rendering.backend = RenderingBackend::DirectX12;
+        // DirectX12 and Vulkan both name "the GPU backend", so one INI works on every platform.
+        if (backend == "directx12" || backend == "dx12" || backend == "d3d12" || backend == "gpu" ||
+            backend == "vulkan" || backend == "vk")
+            config.rendering.backend = kPlatformGpuBackend;
         else
-            warning(config, line, "Rendering.Backend only supports DirectX12");
+            warning(config, line, "Rendering.Backend only supports DirectX12 or Vulkan");
         return;
     }
     if (key == "internalresolutionmode" || key == "internalmode") {
@@ -806,8 +808,9 @@ void initialize_lcs_render_configuration(const std::filesystem::path &executable
     }
     if (std::getenv("PSPRECOMP_GE_BACKEND") == nullptr) {
         set_environment_value("PSPRECOMP_GE_BACKEND",
-                              config.rendering.backend == RenderingBackend::DirectX12
-                                  ? "directx12" : "software");
+                              config.rendering.backend == RenderingBackend::DirectX12 ? "directx12"
+                              : config.rendering.backend == RenderingBackend::Vulkan  ? "vulkan"
+                                                                                      : "software");
     }
     const InternalResolutionDimensions internal =
         resolve_internal_resolution(config.rendering);
@@ -933,6 +936,7 @@ const char *rendering_backend_name(RenderingBackend backend) noexcept {
     switch (backend) {
     case RenderingBackend::Software: return "Software";
     case RenderingBackend::DirectX12: return "DirectX 12";
+    case RenderingBackend::Vulkan: return "Vulkan";
     }
     return "Unknown";
 }

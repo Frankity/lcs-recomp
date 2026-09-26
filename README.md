@@ -16,13 +16,17 @@ Requires Visual Studio 2022 and LLVM (clang-cl).
 lcs\BUILD_LCS.bat
 ```
 
-## Play
+## Play in Windows
 
 ```text
 lcs\PLAY_LCS.bat
 ```
 
 Settings are in `lcs/config/LCSNative.ini`.
+
+## Play in Linux
+
+please read [`play-linux`](plan-linux.md)
 
 ## License
 

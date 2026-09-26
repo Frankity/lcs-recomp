@@ -2,8 +2,19 @@ set(FFMPEG_LIBS avcodec avformat avutil swresample swscale)
 set(FFMPEG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg)
 
 file(GLOB HOST_SOURCES CONFIGURE_DEPENDS host/*.cpp)
+# Windows: Win32 window + DirectX 12. Elsewhere: SDL3 window + Vulkan (SDL also drives the DualSense).
+if(WIN32)
+    list(REMOVE_ITEM HOST_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/host/ge_gpu_backend_vulkan.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/host/display_window_sdl.cpp)
+else()
+    list(REMOVE_ITEM HOST_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/host/ge_gpu_backend_dx12.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/host/display_window.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/host/lcs_dualsense.cpp)
+endif()
 add_executable(LCSNative ${HOST_SOURCES})
-target_include_directories(LCSNative PRIVATE host ${FFMPEG_DIR}/include)
+target_include_directories(LCSNative PRIVATE host)
 target_link_libraries(LCSNative PRIVATE psprecomp_core)
 
 if(MSVC)
@@ -12,6 +23,7 @@ if(MSVC)
 endif()
 
 if(WIN32)
+    target_include_directories(LCSNative PRIVATE ${FFMPEG_DIR}/include)
     target_sources(LCSNative PRIVATE resources/LCSNative.rc)
     target_link_libraries(LCSNative PRIVATE gdi32 user32 winmm hid setupapi d3d12 dxgi d3dcompiler dxguid)
     foreach(lib ${FFMPEG_LIBS})
@@ -28,10 +40,11 @@ if(WIN32)
                 -Executable $<TARGET_FILE:LCSNative>)
     endif()
 else()
-    foreach(lib ${FFMPEG_LIBS})
-        find_library(FFMPEG_${lib} ${lib} REQUIRED)
-        target_link_libraries(LCSNative PRIVATE ${FFMPEG_${lib}})
-    endforeach()
+    find_package(Vulkan REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LCS_DEPS REQUIRED IMPORTED_TARGET
+        sdl3 shaderc libavcodec libavformat libavutil libswresample libswscale)
+    target_link_libraries(LCSNative PRIVATE Vulkan::Vulkan PkgConfig::LCS_DEPS)
 endif()
 
 file(GLOB GENERATED_SOURCES CONFIGURE_DEPENDS generated/*.cpp)

@@ -12,9 +12,11 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <mutex>
 
+// The output device is waveOut on Windows and an SDL3 audio stream elsewhere; only the small
+// device layer below differs, the mixing and timeline logic is shared.
 #if defined(_WIN32)
-
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -23,8 +25,9 @@
 #endif
 #include <windows.h>
 #include <mmsystem.h>
-
-#include <mutex>
+#else
+#include <SDL3/SDL.h>
+#endif
 
 namespace lcs {
 namespace {
@@ -39,10 +42,22 @@ constexpr std::size_t kRingFrames = kSampleRate * 2u;
 constexpr std::size_t kGuestChannels = 9u;
 constexpr std::uint64_t kChannelDiscontinuityFrames = 64u;
 
+#if defined(_WIN32)
 struct Block {
     WAVEHDR header{};
     std::vector<std::int16_t> samples;
 };
+
+struct AudioDevice {
+    HWAVEOUT handle{nullptr};
+    std::vector<Block> blocks;
+    std::size_t next_block{};
+};
+#else
+struct AudioDevice {
+    SDL_AudioStream *stream{};
+};
+#endif
 
 struct ChannelStream {
     StreamingLinearResampler resampler;
@@ -55,9 +70,8 @@ struct ChannelStream {
 
 struct AudioState {
     std::mutex mutex;
-    HWAVEOUT device{nullptr};
-    std::vector<Block> blocks;
-    std::size_t next_block{};
+    AudioDevice device;
+    std::vector<std::int16_t> block_samples;  // the block being handed to the device
     std::vector<std::int32_t> ring;
     std::uint64_t output_frame{};
     std::uint64_t guest_anchor_us{};
@@ -112,12 +126,142 @@ std::size_t configured_prebuffer_blocks() {
     return std::clamp<std::size_t>(static_cast<std::size_t>(value), 2u, kBlockCount - 2u);
 }
 
-std::size_t outstanding_blocks(const AudioState &state) {
+#if defined(_WIN32)
+
+bool device_open(AudioDevice &device) {
+    WAVEFORMATEX format{};
+    format.wFormatTag = WAVE_FORMAT_PCM;
+    format.nChannels = static_cast<WORD>(kOutputChannels);
+    format.nSamplesPerSec = kSampleRate;
+    format.wBitsPerSample = 16u;
+    format.nBlockAlign = static_cast<WORD>(kOutputChannels * sizeof(std::int16_t));
+    format.nAvgBytesPerSec = kSampleRate * format.nBlockAlign;
+
+    const MMRESULT open_result =
+        waveOutOpen(&device.handle, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL);
+    if (open_result != MMSYSERR_NOERROR) {
+        if (diagnostics_enabled())
+            std::cerr << "[audio-host] waveOutOpen failed code=" << open_result << "\n";
+        device.handle = nullptr;
+        return false;
+    }
+    (void)waveOutPause(device.handle);
+    device.blocks.resize(kBlockCount);
+    device.next_block = 0u;
+    return true;
+}
+
+void device_pause(AudioDevice &device) { (void)waveOutPause(device.handle); }
+
+bool device_resume(AudioDevice &device) { return waveOutRestart(device.handle) == MMSYSERR_NOERROR; }
+
+std::size_t device_outstanding_blocks(const AudioDevice &device) {
     return static_cast<std::size_t>(std::count_if(
-        state.blocks.begin(), state.blocks.end(), [](const Block &block) {
+        device.blocks.begin(), device.blocks.end(), [](const Block &block) {
             return (block.header.dwFlags & WHDR_PREPARED) != 0u &&
                 (block.header.dwFlags & WHDR_DONE) == 0u;
         }));
+}
+
+// Whether the next block slot is free (its previous contents have been played).
+bool device_can_queue(AudioDevice &device) {
+    Block &block = device.blocks[device.next_block];
+    if ((block.header.dwFlags & WHDR_PREPARED) != 0u) {
+        if ((block.header.dwFlags & WHDR_DONE) == 0u) return false;
+        (void)waveOutUnprepareHeader(device.handle, &block.header, sizeof(WAVEHDR));
+    }
+    return true;
+}
+
+bool device_queue(AudioDevice &device, const std::vector<std::int16_t> &samples) {
+    Block &block = device.blocks[device.next_block];
+    block.samples = samples;
+    block.header = WAVEHDR{};
+    block.header.lpData = reinterpret_cast<LPSTR>(block.samples.data());
+    block.header.dwBufferLength = static_cast<DWORD>(block.samples.size() * sizeof(std::int16_t));
+    const MMRESULT prepare_result =
+        waveOutPrepareHeader(device.handle, &block.header, sizeof(WAVEHDR));
+    if (prepare_result != MMSYSERR_NOERROR) {
+        if (diagnostics_enabled())
+            std::cerr << "[audio-host] waveOutPrepareHeader failed code="
+                      << prepare_result << "\n";
+        return false;
+    }
+    const MMRESULT write_result = waveOutWrite(device.handle, &block.header, sizeof(WAVEHDR));
+    if (write_result != MMSYSERR_NOERROR) {
+        if (diagnostics_enabled())
+            std::cerr << "[audio-host] waveOutWrite failed code=" << write_result << "\n";
+        (void)waveOutUnprepareHeader(device.handle, &block.header, sizeof(WAVEHDR));
+        return false;
+    }
+    device.next_block = (device.next_block + 1u) % device.blocks.size();
+    return true;
+}
+
+void device_close(AudioDevice &device, bool playback_started) {
+    if (!playback_started) (void)waveOutRestart(device.handle);
+    (void)waveOutReset(device.handle);
+    for (Block &block : device.blocks) {
+        if ((block.header.dwFlags & WHDR_PREPARED) != 0u)
+            (void)waveOutUnprepareHeader(device.handle, &block.header, sizeof(WAVEHDR));
+    }
+    (void)waveOutClose(device.handle);
+    device.handle = nullptr;
+    device.blocks.clear();
+}
+
+#else
+
+constexpr std::size_t kBlockBytes = kBlockFrames * kOutputChannels * sizeof(std::int16_t);
+
+bool device_open(AudioDevice &device) {
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        if (diagnostics_enabled())
+            std::cerr << "[audio-host] SDL audio init failed: " << SDL_GetError() << "\n";
+        return false;
+    }
+    const SDL_AudioSpec spec{SDL_AUDIO_S16, static_cast<int>(kOutputChannels), static_cast<int>(kSampleRate)};
+    // the device starts paused, like waveOut after waveOutPause
+    device.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+    if (device.stream == nullptr) {
+        if (diagnostics_enabled())
+            std::cerr << "[audio-host] SDL_OpenAudioDeviceStream failed: " << SDL_GetError() << "\n";
+        return false;
+    }
+    return true;
+}
+
+void device_pause(AudioDevice &device) { (void)SDL_PauseAudioStreamDevice(device.stream); }
+
+bool device_resume(AudioDevice &device) { return SDL_ResumeAudioStreamDevice(device.stream); }
+
+// Blocks not played yet; a partly played block still counts, as in waveOut.
+std::size_t device_outstanding_blocks(const AudioDevice &device) {
+    const int queued = SDL_GetAudioStreamQueued(device.stream);
+    return queued <= 0 ? 0u : (static_cast<std::size_t>(queued) + kBlockBytes - 1u) / kBlockBytes;
+}
+
+bool device_can_queue(AudioDevice &device) { return device_outstanding_blocks(device) < kBlockCount; }
+
+bool device_queue(AudioDevice &device, const std::vector<std::int16_t> &samples) {
+    if (SDL_PutAudioStreamData(device.stream, samples.data(),
+                               static_cast<int>(samples.size() * sizeof(std::int16_t))))
+        return true;
+    if (diagnostics_enabled())
+        std::cerr << "[audio-host] SDL_PutAudioStreamData failed: " << SDL_GetError() << "\n";
+    return false;
+}
+
+void device_close(AudioDevice &device, bool) {
+    SDL_DestroyAudioStream(device.stream);
+    device.stream = nullptr;
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+}
+
+#endif
+
+std::size_t outstanding_blocks(const AudioState &state) {
+    return device_outstanding_blocks(state.device);
 }
 
 void wav_write_u16(std::ostream &out, std::uint16_t value) {
@@ -174,28 +318,12 @@ bool ensure_device(AudioState &state) {
     if (state.opened) return true;
     if (state.failed) return false;
 
-    WAVEFORMATEX format{};
-    format.wFormatTag = WAVE_FORMAT_PCM;
-    format.nChannels = static_cast<WORD>(kOutputChannels);
-    format.nSamplesPerSec = kSampleRate;
-    format.wBitsPerSample = 16u;
-    format.nBlockAlign = static_cast<WORD>(kOutputChannels * sizeof(std::int16_t));
-    format.nAvgBytesPerSec = kSampleRate * format.nBlockAlign;
-
-    const MMRESULT open_result =
-        waveOutOpen(&state.device, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL);
-    if (open_result != MMSYSERR_NOERROR) {
-        if (diagnostics_enabled())
-            std::cerr << "[audio-host] waveOutOpen failed code=" << open_result << "\n";
+    if (!device_open(state.device)) {
         state.failed = true;
-        state.device = nullptr;
         return false;
     }
 
-    (void)waveOutPause(state.device);
-    state.blocks.resize(kBlockCount);
     state.ring.assign(kRingFrames * kOutputChannels, 0);
-    state.next_block = 0u;
     state.output_frame = 0u;
     state.queued_blocks = 0u;
     state.prebuffer_blocks = configured_prebuffer_blocks();
@@ -213,7 +341,7 @@ bool ensure_device(AudioState &state) {
     }
     open_wav_capture(state);
     if (diagnostics_enabled())
-        std::cerr << "[audio-host] waveOut 44100Hz stereo block_frames=" << kBlockFrames
+        std::cerr << "[audio-host] 44100Hz stereo block_frames=" << kBlockFrames
                   << " blocks=" << kBlockCount
                   << " prebuffer_blocks=" << state.prebuffer_blocks
                   << " prebuffer_ms="
@@ -229,60 +357,39 @@ std::uint64_t guest_frame_for(const AudioState &state, std::uint64_t guest_time_
 }
 
 bool queue_one_block(AudioState &state) {
-    Block &block = state.blocks[state.next_block];
-    if ((block.header.dwFlags & WHDR_PREPARED) != 0u) {
-        if ((block.header.dwFlags & WHDR_DONE) == 0u) return false;
-        (void)waveOutUnprepareHeader(state.device, &block.header, sizeof(WAVEHDR));
-    }
+    if (!device_can_queue(state.device)) return false;
 
-    block.samples.resize(kBlockFrames * kOutputChannels);
+    std::vector<std::int16_t> &samples = state.block_samples;
+    samples.resize(kBlockFrames * kOutputChannels);
     for (std::size_t frame = 0u; frame < kBlockFrames; ++frame) {
         const std::size_t slot =
             static_cast<std::size_t>((state.output_frame + frame) % kRingFrames) * kOutputChannels;
         for (std::size_t channel = 0u; channel < kOutputChannels; ++channel) {
-            block.samples[frame * kOutputChannels + channel] = static_cast<std::int16_t>(
+            samples[frame * kOutputChannels + channel] = static_cast<std::int16_t>(
                 std::clamp(state.ring[slot + channel], -32768, 32767));
             state.ring[slot + channel] = 0;
         }
     }
 
     if (state.wav_capture.is_open()) {
-        state.wav_capture.write(reinterpret_cast<const char *>(block.samples.data()),
-                                static_cast<std::streamsize>(block.samples.size() * sizeof(std::int16_t)));
+        state.wav_capture.write(reinterpret_cast<const char *>(samples.data()),
+                                static_cast<std::streamsize>(samples.size() * sizeof(std::int16_t)));
         if (state.wav_capture) state.wav_frames += kBlockFrames;
     }
 
-    block.header = WAVEHDR{};
-    block.header.lpData = reinterpret_cast<LPSTR>(block.samples.data());
-    block.header.dwBufferLength = static_cast<DWORD>(block.samples.size() * sizeof(std::int16_t));
-    const MMRESULT prepare_result =
-        waveOutPrepareHeader(state.device, &block.header, sizeof(WAVEHDR));
-    if (prepare_result != MMSYSERR_NOERROR) {
-        if (diagnostics_enabled())
-            std::cerr << "[audio-host] waveOutPrepareHeader failed code="
-                      << prepare_result << "\n";
-        return false;
-    }
-    const MMRESULT write_result = waveOutWrite(state.device, &block.header, sizeof(WAVEHDR));
-    if (write_result != MMSYSERR_NOERROR) {
-        if (diagnostics_enabled())
-            std::cerr << "[audio-host] waveOutWrite failed code=" << write_result << "\n";
-        (void)waveOutUnprepareHeader(state.device, &block.header, sizeof(WAVEHDR));
-        return false;
-    }
+    if (!device_queue(state.device, samples)) return false;
 
     state.output_frame += kBlockFrames;
-    state.next_block = (state.next_block + 1u) % state.blocks.size();
     ++state.queued_blocks;
 
     const std::size_t target_blocks = state.recovering_from_underrun
         ? state.recovery_prebuffer_blocks : state.prebuffer_blocks;
     if (!state.playback_started && outstanding_blocks(state) >= target_blocks) {
-        if (waveOutRestart(state.device) == MMSYSERR_NOERROR) {
+        if (device_resume(state.device)) {
             state.playback_started = true;
             state.recovering_from_underrun = false;
             if (diagnostics_enabled())
-                std::cerr << "[audio-host] waveOut started with " << state.queued_blocks
+                std::cerr << "[audio-host] playback started with " << state.queued_blocks
                           << " prebuffered blocks\n";
         }
     }
@@ -294,7 +401,7 @@ void advance_locked(AudioState &state, std::uint64_t guest_time_us) {
     std::size_t outstanding = outstanding_blocks(state);
     if (state.playback_started) {
         if (outstanding == 0u) {
-            (void)waveOutPause(state.device);
+            device_pause(state.device);
             ++state.underrun_rebuffers;
             state.playback_started = false;
             state.recovering_from_underrun = true;
@@ -476,21 +583,13 @@ void audio_output_reset_channel(std::uint32_t channel) {
 void audio_output_shutdown() {
     AudioState &state = audio_state();
     std::lock_guard<std::mutex> guard(state.mutex);
-    if (!state.opened || state.device == nullptr) return;
+    if (!state.opened) return;
 
-    if (!state.playback_started) (void)waveOutRestart(state.device);
-    (void)waveOutReset(state.device);
-    for (Block &block : state.blocks) {
-        if ((block.header.dwFlags & WHDR_PREPARED) != 0u)
-            (void)waveOutUnprepareHeader(state.device, &block.header, sizeof(WAVEHDR));
-    }
-    (void)waveOutClose(state.device);
+    device_close(state.device, state.playback_started);
     close_wav_capture(state);
     if (state.diagnostics_log.is_open()) state.diagnostics_log.close();
 
-    state.device = nullptr;
     state.opened = false;
-    state.blocks.clear();
     state.ring.clear();
     state.timeline_anchored = false;
     state.playback_started = false;
@@ -510,19 +609,3 @@ void audio_output_shutdown() {
 }
 
 }
-
-#else
-
-namespace lcs {
-
-bool audio_output_enabled() { return false; }
-void audio_output_submit(std::span<const std::int16_t>, std::uint32_t, bool,
-                         std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-                         std::uint64_t, std::uint64_t) {}
-void audio_output_advance(std::uint64_t) {}
-void audio_output_reset_channel(std::uint32_t) {}
-void audio_output_shutdown() {}
-
-}
-
-#endif

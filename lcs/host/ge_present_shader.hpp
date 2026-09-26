@@ -3,9 +3,14 @@
 namespace lcs {
 
 inline constexpr char kGePresentShaderHlsl[] = R"PRESENT_HLSL(
-Texture2D<float4> PresentTexture0 : register(t0);
-Texture2D<float4> PresentTexture1 : register(t1);
-SamplerState PresentSampler : register(s0);
+// See ge_shader.hpp: the vk:: decorations only apply to the Vulkan (SPIR-V) build.
+#ifdef LCS_VULKAN
+#define LCS_BINDING(slot, space) [[vk::binding(slot, space)]]
+#else
+#define LCS_BINDING(slot, space)
+#endif
+LCS_BINDING(0, 0) Texture2D<float4> PresentTexture0 : register(t0);
+LCS_BINDING(0, 1) SamplerState PresentSampler : register(s0);
 
 struct PresentVertexOutput { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
 PresentVertexOutput PresentVS(uint id : SV_VertexID) {
@@ -15,7 +20,11 @@ PresentVertexOutput PresentVS(uint id : SV_VertexID) {
     else { o.position=float4(3,-1,0,1); o.uv=float2(2,1); }
     return o;
 }
+#ifdef LCS_VULKAN
+[[vk::push_constant]] cbuffer PresentConstants {
+#else
 cbuffer PresentConstants : register(b1) {
+#endif
     float4 BloomTexel;   // bloom passes: xy texel size of the source, zw blur direction
     float4 BloomParams;  // bloom passes: x brightness threshold, y gain
     float4 PostA;        // present: x sharpness, y contrast, z saturation, w gamma

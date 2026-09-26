@@ -51,6 +51,7 @@ int main(int argc, char **argv) {
                      : std::filesystem::current_path();
         lcs::initialize_lcs_render_configuration(executable_directory);
 
+        elf_path = psprecomp::resolve_path_case_insensitive(elf_path);
         auto elf = psprecomp::Elf32Image::from_file(elf_path);
 
         psprecomp::Runtime runtime;

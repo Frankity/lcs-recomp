@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -18,6 +19,39 @@ namespace psprecomp {
 bool g_runtime_chain_observers_active = false;
 std::uint64_t g_runtime_starvation_interval_fast = 0u;
 std::uint64_t g_runtime_thread_switch_generation_fast = 0u;
+
+std::filesystem::path resolve_path_case_insensitive(const std::filesystem::path &path) {
+#if defined(_WIN32)
+    return path;
+#else
+    std::error_code error;
+    if (path.empty() || std::filesystem::exists(path, error)) return path;
+    const auto lower = [](std::string text) {
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return text;
+    };
+    std::filesystem::path resolved = path.root_path();
+    bool matching = true;
+    for (const auto &part : path.relative_path()) {
+        std::filesystem::path next = resolved / part;
+        if (matching && !std::filesystem::exists(next, error)) {
+            matching = false;
+            const std::string wanted = lower(part.string());
+            const std::filesystem::path directory = resolved.empty() ? "." : resolved;
+            for (const auto &entry : std::filesystem::directory_iterator(directory, error)) {
+                if (lower(entry.path().filename().string()) == wanted) {
+                    next = resolved / entry.path().filename();
+                    matching = true;
+                    break;
+                }
+            }
+        }
+        resolved = std::move(next);
+    }
+    return resolved;
+#endif
+}
 
 namespace {
 using RuntimePostImportHook = void (*)(Runtime &, AllegrexContext &);
@@ -506,7 +540,7 @@ std::filesystem::path Runtime::translate_path(const std::string &psp_path) const
         if (part == "..") throw Error("Rejected PSP path traversal: " + psp_path);
         if (part != ".") clean /= part;
     }
-    return game_root_ / clean;
+    return resolve_path_case_insensitive(game_root_ / clean);
 }
 
 void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {

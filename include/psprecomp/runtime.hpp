@@ -15,6 +15,11 @@
 
 namespace psprecomp {
 
+// Game files were authored for a case-insensitive file system (the UMD and Windows). On other
+// systems this finds the existing file or directory whose name differs only in case; components
+// that do not exist yet are kept as given. On Windows the path is returned unchanged.
+[[nodiscard]] std::filesystem::path resolve_path_case_insensitive(const std::filesystem::path &path);
+
 // generated direct-unit chaining stays on a zero-observer fast path.
 // Diagnostics flip this once for the process and transparently fall back to the
 // fully instrumented runtime lookup. Keeping this as a plain process-global bool
