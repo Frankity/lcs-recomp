@@ -11,6 +11,7 @@
 #include <deque>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -93,6 +94,18 @@ struct PtpPending {
     Mac mac{};
     std::uint16_t port{};
 };
+
+// Network activity log: always written to LCSNative_net_<udp port>.log (capped), and to the console
+// when LCS_NET_DIAG is set. Each running copy of the game has its own file.
+void net_log(const std::string &line);
+[[nodiscard]] std::string net_mac_text(const Mac &mac);
+
+#define NETLOG(expr)                                   \
+    do {                                               \
+        std::ostringstream lcs_net_stream;             \
+        lcs_net_stream << expr;                        \
+        ::lcs::net_log(lcs_net_stream.str());          \
+    } while (0)
 
 class AdhocNet {
 public:
