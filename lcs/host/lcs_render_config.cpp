@@ -502,6 +502,30 @@ void apply_widescreen_key(LcsConfiguration &config, const std::string &key,
     warning(config, line, "unknown [Widescreen] key '" + key + "'");
 }
 
+void apply_multiplayer_key(LcsConfiguration &config, const std::string &key,
+                           const std::string &value, std::size_t line) {
+    if (key == "enabled") {
+        if (!parse_bool(value, config.multiplayer.enabled))
+            warning(config, line, "Multiplayer.Enabled expects true/false");
+        return;
+    }
+    if (key == "port") {
+        if (!parse_u32(value, 1024u, 60000u, config.multiplayer.port))
+            warning(config, line, "Multiplayer.Port must be between 1024 and 60000");
+        return;
+    }
+    if (key == "peers") {
+        config.multiplayer.peers = trim_copy(value);
+        return;
+    }
+    if (key == "nickname" || key == "name") {
+        const std::string name = trim_copy(value);
+        if (!name.empty()) config.multiplayer.nickname = name.substr(0u, 24u);
+        return;
+    }
+    warning(config, line, "unknown [Multiplayer] key '" + key + "'");
+}
+
 void apply_timing_key(LcsConfiguration &config, const std::string &key,
                       const std::string &value, std::size_t line) {
     if (key == "framerate" || key == "fps" || key == "targetfps") {
@@ -763,6 +787,8 @@ LcsConfiguration load_lcs_render_configuration(const std::filesystem::path &path
             apply_widescreen_key(config, key, value, line_number);
         else if (section == "controls")
             apply_controls_key(config, key, value, line_number);
+        else if (section == "multiplayer")
+            apply_multiplayer_key(config, key, value, line_number);
         else if (section == "project2dfx" || section == "project 2dfx" ||
                  section == "lodlights" || section == "lod lights" ||
                  section == "trafficlights" || section == "traffic lights" ||
