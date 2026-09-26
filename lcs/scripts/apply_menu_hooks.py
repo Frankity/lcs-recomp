@@ -13,6 +13,7 @@ Hooks (unit -> what they call):
   0182  left/right on a row     lcs_menu_option_step     changes a setting
   0182  tab table / tab -> page lcs_menu_tab_table, lcs_menu_tab_screen
   0182  Cross on YES            lcs_menu_quit_press      closes the game
+  0181  screen change         lcs_menu_is_quit_screen  leaving the QUIT page keeps the menu open
   0183  value text              lcs_menu_value_text
   0183  tab bar drawing         lcs_menu_tab_table, lcs_menu_tab_count
   0063  camera update           lcs_population_distance_scale  (ped/car generation distance)
@@ -69,6 +70,11 @@ edit('generated_unit_0182.cpp', [
     ('L_08ADE4DC:\n    ctx.gpr[4] = (0u | 288u);',
      'L_08ADE4DC:\n    if (lcs::lcs_menu_quit_press(rt.memory(), ctx.gpr[16])) goto L_08ADE5C8;\n    ctx.gpr[4] = (0u | 288u);', 1),
 ])
+
+# screen change: leaving screen 8 closes the pause menu in the game; the QUIT page reuses that screen
+edit('generated_unit_0181.cpp', [(
+    'L_08ADA030:\n    ctx.gpr[4] = (aot_mem.aot_load32(ctx.gpr[16] + static_cast<std::uint32_t>(1380)));',
+    'L_08ADA030:\n    ctx.gpr[4] = (aot_mem.aot_load32(ctx.gpr[16] + static_cast<std::uint32_t>(1380)));\n    if (lcs::lcs_menu_is_quit_screen(ctx.gpr[4])) goto L_08ADA07C;', 1)])
 
 # drawing: value text of option rows, tab table, ninth tab
 edit('generated_unit_0183.cpp', [
