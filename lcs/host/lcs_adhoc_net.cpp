@@ -1,5 +1,6 @@
 #include "lcs_adhoc_net.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -8,6 +9,18 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cerrno>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -19,10 +32,20 @@
 #include <set>
 #include <sstream>
 
+#if defined(_WIN32)
 #pragma comment(lib, "ws2_32.lib")
 
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+constexpr int kSendFlags = 0;
+using SockLen = int;
+#else
+using SOCKET = int;
+constexpr SOCKET INVALID_SOCKET = -1;
+constexpr int kSendFlags = MSG_NOSIGNAL;  // a closed peer must not raise SIGPIPE
+using SockLen = socklen_t;
+inline int closesocket(SOCKET socket) { return close(socket); }
 #endif
 
 namespace lcs {
@@ -72,6 +95,7 @@ void close_socket(std::uintptr_t &value) {
     if (value != kNoSocket) closesocket(as_socket(value));
     value = kNoSocket;
 }
+#if defined(_WIN32)
 void make_nonblocking(SOCKET socket) {
     u_long enable = 1;
     ioctlsocket(socket, FIONBIO, &enable);
@@ -87,6 +111,13 @@ void ensure_wsa() {
     WSADATA data{};
     wsa_started = WSAStartup(MAKEWORD(2, 2), &data) == 0;
 }
+#else
+void make_nonblocking(SOCKET socket) { fcntl(socket, F_SETFL, fcntl(socket, F_GETFL, 0) | O_NONBLOCK); }
+bool would_block() { return errno == EWOULDBLOCK || errno == EAGAIN || errno == EINPROGRESS || errno == EALREADY; }
+
+bool wsa_started = true;
+void ensure_wsa() {}
+#endif
 
 std::string trim(const std::string &text) {
     const auto first = text.find_first_not_of(" \t\r\n");
@@ -140,14 +171,16 @@ bool AdhocNet::start(const AdhocNetConfig &config) {
 
     udp_socket_ = static_cast<std::uintptr_t>(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
     if (udp_socket_ == kNoSocket) return false;
-    BOOL enable = TRUE;
+    int enable = 1;
     setsockopt(as_socket(udp_socket_), SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char *>(&enable),
                sizeof(enable));
+#if defined(_WIN32)
     // Without this, an ICMP "port unreachable" from a peer that is not running turns into a recv error.
     BOOL no_reset = FALSE;
     DWORD returned = 0;
     WSAIoctl(as_socket(udp_socket_), SIO_UDP_CONNRESET, &no_reset, sizeof(no_reset), nullptr, 0, &returned,
              nullptr, nullptr);
+#endif
     make_nonblocking(as_socket(udp_socket_));
 
     bool bound = false;
@@ -155,7 +188,7 @@ bool AdhocNet::start(const AdhocNetConfig &config) {
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = htonl(INADDR_ANY);
-        address.sin_port = htons(static_cast<u_short>(config.port + offset));
+        address.sin_port = htons(static_cast<std::uint16_t>(config.port + offset));
         if (bind(as_socket(udp_socket_), reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0) {
             udp_port_ = static_cast<std::uint16_t>(config.port + offset);
             g_log_port = udp_port_;
@@ -174,7 +207,7 @@ bool AdhocNet::start(const AdhocNetConfig &config) {
     tcp_port_ = static_cast<std::uint16_t>(udp_port_ + 1000u);
     tcp_listener_ = static_cast<std::uintptr_t>(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
     if (tcp_listener_ != kNoSocket) {
-        BOOL reuse = TRUE;
+        int reuse = 1;
         setsockopt(as_socket(tcp_listener_), SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse),
                    sizeof(reuse));
         sockaddr_in address{};
@@ -260,7 +293,7 @@ void AdhocNet::send_frame(std::uint8_t type, const Mac &destination, const std::
         address.sin_addr.s_addr = ip_be;
         address.sin_port = htons(port);
         sendto(as_socket(udp_socket_), reinterpret_cast<const char *>(frame.data()),
-               static_cast<int>(frame.size()), 0, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+               static_cast<int>(frame.size()), kSendFlags, reinterpret_cast<sockaddr *>(&address), sizeof(address));
     };
 
     if (destination != kBroadcastMac) {
@@ -284,7 +317,7 @@ void AdhocNet::receive_frames() {
     std::uint8_t buffer[2048];
     for (int guard = 0; guard < 128; ++guard) {
         sockaddr_in from{};
-        int from_length = sizeof(from);
+        SockLen from_length = sizeof(from);
         const int received = recvfrom(as_socket(udp_socket_), reinterpret_cast<char *>(buffer), sizeof(buffer), 0,
                                       reinterpret_cast<sockaddr *>(&from), &from_length);
         if (received < 0) break;
@@ -735,7 +768,7 @@ std::uint32_t AdhocNet::ptp_connect(std::uint32_t id) {
         socket.socket = static_cast<std::uintptr_t>(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
         if (socket.socket == kNoSocket) return kAdhocErrConnectionRefused;
         make_nonblocking(as_socket(socket.socket));
-        BOOL nodelay = TRUE;
+        int nodelay = 1;
         setsockopt(as_socket(socket.socket), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&nodelay),
                    sizeof(nodelay));
         sockaddr_in address{};
@@ -755,7 +788,7 @@ std::uint32_t AdhocNet::ptp_connect(std::uint32_t id) {
     FD_SET(as_socket(socket.socket), &writable);
     FD_SET(as_socket(socket.socket), &failed);
     timeval none{0, 0};
-    if (select(0, nullptr, &writable, &failed, &none) <= 0) {
+    if (select(static_cast<int>(as_socket(socket.socket)) + 1, nullptr, &writable, &failed, &none) <= 0) {
         if (now_ms() - socket.started_ms > 8000u) {
             close_socket(socket.socket);
             socket.state = PtpState::Open;
@@ -763,7 +796,13 @@ std::uint32_t AdhocNet::ptp_connect(std::uint32_t id) {
         }
         return kAdhocErrWouldBlock;
     }
-    if (FD_ISSET(as_socket(socket.socket), &failed)) {
+    int connect_error = 0;
+#if !defined(_WIN32)
+    // POSIX reports a refused connect as writable, with the reason in SO_ERROR.
+    SockLen error_length = sizeof(connect_error);
+    getsockopt(as_socket(socket.socket), SOL_SOCKET, SO_ERROR, &connect_error, &error_length);
+#endif
+    if (FD_ISSET(as_socket(socket.socket), &failed) || connect_error != 0) {
         close_socket(socket.socket);
         socket.state = PtpState::Open;
         return kAdhocErrConnectionRefused;
@@ -859,7 +898,7 @@ void AdhocNet::poll_tcp() {
             SOCKET accepted = accept(as_socket(tcp_listener_), nullptr, nullptr);
             if (accepted == INVALID_SOCKET) break;
             make_nonblocking(accepted);
-            BOOL nodelay = TRUE;
+            int nodelay = 1;
             setsockopt(accepted, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
             unassigned_.push_back(UnassignedConnection{static_cast<std::uintptr_t>(accepted), {}, now});
         }
@@ -906,7 +945,7 @@ void AdhocNet::poll_tcp() {
         if (socket.state != PtpState::Established) continue;
         while (!socket.tx.empty()) {
             const int sent = send(as_socket(socket.socket), reinterpret_cast<const char *>(socket.tx.data()),
-                                  static_cast<int>(std::min<std::size_t>(socket.tx.size(), 16384u)), 0);
+                                  static_cast<int>(std::min<std::size_t>(socket.tx.size(), 16384u)), kSendFlags);
             if (sent > 0) {
                 socket.tx.erase(socket.tx.begin(), socket.tx.begin() + sent);
                 continue;
