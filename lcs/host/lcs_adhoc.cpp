@@ -192,6 +192,8 @@ bool ensure_started(psprecomp::Runtime &rt, const psprecomp::AllegrexContext &ct
         net_config.port = static_cast<std::uint16_t>(config.port);
         net_config.peers = config.peers;
         net_config.nickname = config.nickname;
+        net_config.lobby_server = config.lobby_server;
+
         s.started = s.net.start(net_config);
     }
     if (!s.started) return false;

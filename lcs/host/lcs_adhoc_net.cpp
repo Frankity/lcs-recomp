@@ -61,7 +61,13 @@ constexpr std::uintptr_t kNoSocket = ~std::uintptr_t{0};
 constexpr int kPortSpan = 8;  // ports tried / probed around the configured one
 constexpr std::size_t kMaxPtpBuffer = 1u << 20;
 
-enum FrameType : std::uint8_t { kFramePresence = 1, kFrameMatch = 2, kFramePdp = 3, kFrameProbe = 4 };
+// kFrameLobbyPeer: a dedicated lobby server's introduction of another player (see
+// send_frame_to_lobby_server / handle_frame). Payload: ip(4, raw) + udpPort(2, LE) + tcpPort(2, LE)
+// + the 32-byte presence payload (group + nickname). Not something a real PSP ever sends; the
+// server builds it because a relayed frame's UDP source is the server itself, not the original
+// player, so the true address has to travel inside the payload instead.
+enum FrameType : std::uint8_t { kFramePresence = 1, kFrameMatch = 2, kFramePdp = 3, kFrameProbe = 4,
+                                kFrameLobbyPeer = 5 };
 enum MatchSub : std::uint8_t {
     kSubHello = 1,
     kSubRequest = 2,
@@ -248,6 +254,28 @@ bool AdhocNet::start(const AdhocNetConfig &config) {
         }
     }
 
+    lobby_server_ = config.lobby_server;
+    if (!lobby_server_.empty()) {
+        std::string host = lobby_server_;
+        std::uint16_t port = 28000u;  // Puerto por defecto del servidor
+        if (const auto colon = lobby_server_.rfind(':'); colon != std::string::npos) {
+            host = lobby_server_.substr(0u, colon);
+            port = static_cast<std::uint16_t>(std::strtoul(lobby_server_.c_str() + colon + 1u, nullptr, 10));
+        }
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        addrinfo *found = nullptr;
+        if (getaddrinfo(host.c_str(), nullptr, &hints, &found) == 0 && found != nullptr) {
+            const auto *address = reinterpret_cast<const sockaddr_in *>(found->ai_addr);
+            lobby_server_addr_ = {address->sin_addr.s_addr, port};
+            freeaddrinfo(found);
+            NETLOG("lobby server: " << host << ":" << port);
+        } else {
+            NETLOG("cannot resolve lobby server '" << lobby_server_ << "'");
+        }
+    }
+
     running_ = true;
     last_presence_ms_ = 0u;
     NETLOG("ad-hoc emulation up: mac " << mac_text(mac_) << " udp " << udp_port_ << " tcp " << tcp_port_ << " peers " << configured_peers_.size());
@@ -351,6 +379,16 @@ void AdhocNet::handle_frame(std::uint8_t type, const Mac &source, const Mac &des
         endpoint.group.assign(reinterpret_cast<const char *>(payload), strnlen(reinterpret_cast<const char *>(payload), 8u));
         endpoint.nickname.assign(reinterpret_cast<const char *>(payload + 8),
                                  strnlen(reinterpret_cast<const char *>(payload + 8), 24u));
+    } else if (type == kFrameLobbyPeer && length >= 40u) {
+        // Corrects what receive_frames() just set from the packet's literal source (the lobby
+        // server) to the introduced player's real address, carried in the payload.
+        Endpoint &endpoint = endpoints_[source];
+        std::memcpy(&endpoint.ip_be, payload, 4u);
+        endpoint.udp_port = get16(payload + 4);
+        endpoint.tcp_port = get16(payload + 6);
+        endpoint.group.assign(reinterpret_cast<const char *>(payload + 8), strnlen(reinterpret_cast<const char *>(payload + 8), 8u));
+        endpoint.nickname.assign(reinterpret_cast<const char *>(payload + 16),
+                                 strnlen(reinterpret_cast<const char *>(payload + 16), 24u));
     } else if (type == kFrameProbe) {
         last_presence_ms_ = 0u;  // announce our group on the next poll
     } else if (type == kFrameMatch) {
@@ -967,6 +1005,42 @@ void AdhocNet::poll_tcp() {
     }
 }
 
+void AdhocNet::send_frame_to_lobby_server(const std::vector<std::uint8_t> &payload) {
+    if (!running_) return;
+
+    // Crear frame de presencia igual al que enviamos por broadcast
+    std::vector<std::uint8_t> frame;
+    frame.reserve(kFrameHeader + payload.size());
+
+    // Cabecera LCSN
+    for (int i = 0; i < 4; ++i) frame.push_back(static_cast<std::uint8_t>((kFrameMagic >> (8 * i)) & 0xFFu));
+    frame.push_back(kFrameVersion);
+    frame.push_back(kFramePresence);  // Tipo: Presencia
+    put16(frame, static_cast<std::uint16_t>(payload.size()));  // Longitud del payload
+
+    // MACs
+    frame.insert(frame.end(), mac_.begin(), mac_.end());                      // MAC origen (yo)
+    frame.insert(frame.end(), kBroadcastMac.begin(), kBroadcastMac.end());   // MAC destino (broadcast)
+
+    // Puertos
+    put16(frame, udp_port_);  // Mi puerto UDP
+    put16(frame, tcp_port_);  // Mi puerto TCP
+
+    // Payload (grupo + nickname)
+    frame.insert(frame.end(), payload.begin(), payload.end());
+
+    // Enviar al servidor de lobby
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = lobby_server_addr_.first;
+    server_addr.sin_port = htons(lobby_server_addr_.second);
+
+    sendto(as_socket(udp_socket_), reinterpret_cast<const char *>(frame.data()),
+           static_cast<int>(frame.size()), kSendFlags, reinterpret_cast<sockaddr *>(&server_addr), sizeof(server_addr));
+
+    NETLOG("heartbeat sent to lobby server");
+}
+
 // --------------------------------------------------------------------------------------- polling
 
 void AdhocNet::poll() {
@@ -979,6 +1053,10 @@ void AdhocNet::poll() {
         std::memcpy(payload.data(), group_.data(), std::min<std::size_t>(group_.size(), 8u));
         std::memcpy(payload.data() + 8, nickname_.data(), std::min<std::size_t>(nickname_.size(), 24u));
         send_frame(kFramePresence, kBroadcastMac, payload);
+
+        if (lobby_server_addr_.first != 0u) {  // Si está configurado
+            send_frame_to_lobby_server(payload);
+        }
     }
     poll_matching();
     poll_tcp();

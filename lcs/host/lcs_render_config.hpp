@@ -175,6 +175,7 @@ struct MultiplayerConfiguration {
     std::uint32_t port{27015u};       // UDP port; TCP uses port + 1000
     std::string peers{};              // extra "address:port" endpoints, comma separated (other PC, or a second copy here)
     std::string nickname{"Player"};   // name shown to the other players
+    std::string lobby_server{};
 };
 
 struct LcsConfiguration {

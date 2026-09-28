@@ -63,6 +63,7 @@ struct AdhocNetConfig {
     std::uint16_t port{27015u};
     std::string peers;  // "address:port" list, comma separated
     std::string nickname{"Player"};
+    std::string lobby_server{};
 };
 
 struct MatchEvent {
@@ -241,6 +242,7 @@ private:
     void poll_tcp();
     void close_ptp_socket(PtpSocket &socket);
     [[nodiscard]] MatchContext *find_context(std::int32_t id);
+    void send_frame_to_lobby_server(const std::vector<std::uint8_t> &payload);
 
     bool running_{false};
     Mac mac_{};
@@ -265,6 +267,10 @@ private:
     std::map<std::uint32_t, PdpSocket> pdp_sockets_;
     std::map<std::uint32_t, PtpSocket> ptp_sockets_;
     std::vector<UnassignedConnection> unassigned_;
+
+    std::string lobby_server_;
+    std::pair<std::uint32_t, std::uint16_t> lobby_server_addr_;
+    std::uint64_t last_lobby_heartbeat_ms_{0};
 };
 
 }  // namespace lcs

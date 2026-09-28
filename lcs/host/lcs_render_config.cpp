@@ -548,6 +548,10 @@ void apply_multiplayer_key(LcsConfiguration &config, const std::string &key,
         if (!name.empty()) config.multiplayer.nickname = name.substr(0u, 24u);
         return;
     }
+    if (key == "lobbyserver") {
+          config.multiplayer.lobby_server = trim_copy(value);
+          return;
+      }
     warning(config, line, "unknown [Multiplayer] key '" + key + "'");
 }
 
