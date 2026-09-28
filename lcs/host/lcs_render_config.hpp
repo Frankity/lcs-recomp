@@ -106,6 +106,9 @@ struct RenderingConfiguration {
     BloomMode bloom{BloomMode::Low};  // glow around bright lights, added when presenting
     float lod_scale{2.0f};  // multiplies the distances at which the game switches to lower detail
     float draw_distance{1.5f};  // multiplies the distance at which pedestrians and cars are generated
+    float ped_density{1.0f};      // multiplies how many pedestrians the game keeps around (1 = PSP)
+    float traffic_density{1.0f};  // multiplies how many cars the game keeps around (1 = PSP)
+    float field_of_view{1.0f};  // multiplies the tangent of the camera's half field of view
     float fog_distance{1.0f};  // multiplies the distance of the game's fog; 0 turns the fog off
     float sharpness{0.0f};    // contrast adaptive sharpening of the presented image, 0 (off) - 1
     float contrast{1.0f};     // 1 = unchanged
@@ -118,6 +121,8 @@ struct RenderingConfiguration {
     bool hdr{false};  // 16-bit float colour targets, tone-mapped when presented (needs a restart)
     float ambient_light{1.0f};      // multiplies the ambient part of the game's lighting
     float directional_light{1.0f};  // multiplies the diffuse part of the game's lights (sun and lamps)
+    bool ray_traced_shadows{false};  // sun shadows traced against the frame's geometry (Vulkan, needs a restart)
+    float shadow_strength{0.5f};     // how much a ray-traced shadow darkens, 0 - 1
     bool experimental_gpu_color_preview{false};
     bool gpu_geometry_debug_colors{false};
     std::uint64_t dump_gpu_frame_vblank{0u};
@@ -206,6 +211,7 @@ struct PostProcessSettings {
     // Lighting is not post-processing, but it is changed the same way (live, from the menu).
     std::atomic<float> ambient_light{1.0f};
     std::atomic<float> directional_light{1.0f};
+    std::atomic<float> shadow_strength{0.5f};  // ray-traced shadows
 };
 [[nodiscard]] PostProcessSettings &lcs_post_settings() noexcept;
 
@@ -213,6 +219,9 @@ struct PostProcessSettings {
 // Rendering.FogDistance and can be changed while the game runs.
 [[nodiscard]] float lcs_fog_distance_scale() noexcept;
 void lcs_set_fog_distance_scale(float scale) noexcept;
+
+// Field of view factor (1 = the game's), starts at Rendering.FieldOfView; changeable while running.
+void lcs_set_field_of_view_scale(float scale) noexcept;
 
 // Writes `key=value` into `section` of the loaded ini file (other lines are kept). The running
 // process keeps its current settings; the change applies on the next launch.

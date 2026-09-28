@@ -215,6 +215,8 @@ struct VkTexture {
     std::uint64_t cache_bytes{};   // size charged to the texture cache (the decoded, not the scaled, size)
 };
 
+struct ImageViewHolder;
+
 struct FramebufferTarget {
     std::uint32_t address{};
     std::uint32_t logical_width{};
@@ -231,6 +233,7 @@ struct FramebufferTarget {
     VkImageLayout feedback_layout{VK_IMAGE_LAYOUT_UNDEFINED};
     bool msaa_dirty{};  // rendered since the last resolve
     std::uint64_t last_render_epoch{};
+    std::shared_ptr<ImageViewHolder> depth_sample;  // depth-only view read by the shadow pass
 };
 
 struct BloomTarget {
@@ -251,6 +254,75 @@ struct SwapchainImage {
     VkImageView view{};
     VkSemaphore render_finished{};
 };
+
+// ---- ray tracing resources (Rendering.RayTracedShadows) ----------------------------------------
+
+struct ImageViewHolder {
+    VkDevice device{};
+    VkImageView view{};
+    ImageViewHolder() = default;
+    ImageViewHolder(const ImageViewHolder &) = delete;
+    ImageViewHolder &operator=(const ImageViewHolder &) = delete;
+    ~ImageViewHolder() {
+        if (device != VK_NULL_HANDLE && view != VK_NULL_HANDLE) vkDestroyImageView(device, view, nullptr);
+    }
+};
+
+// A buffer with a device address (acceleration structure inputs, storage and scratch).
+struct RtBuffer {
+    VkDevice device{};
+    VkBuffer buffer{};
+    VkDeviceMemory memory{};
+    std::byte *mapped{};
+    VkDeviceSize size{};
+    VkDeviceAddress address{};
+    RtBuffer() = default;
+    RtBuffer(const RtBuffer &) = delete;
+    RtBuffer &operator=(const RtBuffer &) = delete;
+    ~RtBuffer() {
+        if (device == VK_NULL_HANDLE) return;
+        if (mapped != nullptr) vkUnmapMemory(device, memory);
+        if (buffer != VK_NULL_HANDLE) vkDestroyBuffer(device, buffer, nullptr);
+        if (memory != VK_NULL_HANDLE) vkFreeMemory(device, memory, nullptr);
+    }
+};
+using RtBufferPtr = std::shared_ptr<RtBuffer>;
+
+struct RtAccel {
+    VkDevice device{};
+    PFN_vkDestroyAccelerationStructureKHR destroy{};
+    VkAccelerationStructureKHR handle{};
+    VkDeviceSize size{};
+    VkDeviceAddress address{};
+    RtBufferPtr storage;  // released after the structure
+    RtAccel() = default;
+    RtAccel(const RtAccel &) = delete;
+    RtAccel &operator=(const RtAccel &) = delete;
+    ~RtAccel() {
+        if (device != VK_NULL_HANDLE && handle != VK_NULL_HANDLE && destroy != nullptr)
+            destroy(device, handle, nullptr);
+    }
+};
+
+// Per frame in flight: rebuilt every frame once that frame's previous submission has finished.
+struct RtFrame {
+    RtBufferPtr positions;  // view-space triangles, 3 floats per vertex
+    RtBufferPtr instances;  // the one TLAS instance
+    RtBufferPtr scratch;
+    RtBufferPtr blas_storage;
+    RtBufferPtr tlas_storage;
+    std::shared_ptr<RtAccel> blas;
+    std::shared_ptr<RtAccel> tlas;
+    VkDescriptorSet set{};
+};
+
+// Push constants of the shadow pass (std430 layout of ShadowConstants in the GLSL).
+struct RtShadowConstants {
+    std::array<float, 16> clip_to_view{};  // column-major: (NDC x, y, depth, 1) -> view space
+    std::array<float, 4> sun{};            // xyz towards the sun (view space), w darkening
+    std::array<float, 4> target{};         // xy target size, z shadow distance, w debug
+};
+static_assert(sizeof(RtShadowConstants) == 96u);
 
 struct VkGeState {
     GeGpuBackendReport report{};
@@ -352,6 +424,49 @@ struct VkGeState {
     bool readback_enabled{};
     bool texture_upload_ring_enabled{true};
     std::string adapter_name;
+
+    // ray-traced sun shadows
+    bool rt_supported{};  // requested, and the device has acceleration structures and ray queries
+    bool rt_active{};     // all shadow resources were created
+    PFN_vkGetAccelerationStructureBuildSizesKHR rt_build_sizes{};
+    PFN_vkCreateAccelerationStructureKHR rt_create{};
+    PFN_vkDestroyAccelerationStructureKHR rt_destroy{};
+    PFN_vkCmdBuildAccelerationStructuresKHR rt_cmd_build{};
+    PFN_vkGetAccelerationStructureDeviceAddressKHR rt_address{};
+    VkDeviceSize rt_scratch_alignment{256u};
+    VkDescriptorSetLayout rt_set_layout{};
+    VkPipelineLayout rt_pipeline_layout{};
+    VkDescriptorPool rt_descriptor_pool{};
+    VkSampler rt_sampler{};
+    VkShaderModule rt_shader{};
+    VkPipeline rt_pipeline{};
+    std::array<RtFrame, kFrameCount> rt_frames;
+    std::vector<float> rt_positions;
+    // Objects the game drew, in world space, keyed by world matrix and vertices. Static ones keep
+    // casting shadows while they are outside the view, where the game does not draw them.
+    struct RtCachedMesh {
+        std::vector<float> triangles;  // 9 floats per triangle
+        std::array<float, 3> low{};
+        std::array<float, 3> high{};
+        std::uint64_t last_seen{};
+        std::uint32_t seen{};  // frames it was drawn
+    };
+    std::unordered_map<std::uint64_t, RtCachedMesh> rt_cache;
+    std::size_t rt_cache_triangles{};
+    std::uint64_t rt_cache_frame{};
+    std::size_t rt_pass_before{std::numeric_limits<std::size_t>::max()};  // batch index (size() = after all)
+    std::uint32_t rt_target{};
+    RtShadowConstants rt_constants{};
+    struct SunObservation {
+        std::array<float, 12> view{};
+        std::array<float, 3> world{};
+        float intensity{};
+    };
+    std::vector<SunObservation> sun_observations;  // this frame's lit draws
+    std::array<float, 3> sun_world{};  // the last sun seen by the main camera
+    float sun_intensity{};
+    bool sun_seen{};
+    std::uint64_t rt_frames_traced{};
 };
 
 // Never destroyed at exit: Vulkan objects must not be released from static destructors (the
@@ -359,6 +474,12 @@ struct VkGeState {
 VkGeState &state() {
     static VkGeState &s = *new VkGeState;
     return s;
+}
+
+// Ray-traced shadow messages also go to the console: they tell whether the feature is running.
+void rt_log(const std::string &line) {
+    runtime_log_line("vulkan ray-traced shadows: " + line);
+    std::cerr << "[rt-shadows] " << line << '\n';
 }
 
 bool env_flag(const char *name, bool fallback) noexcept {
@@ -823,6 +944,20 @@ void select_depth_and_msaa(VkGeState &s) noexcept {
     }
     s.report.dx12_msaa_samples = static_cast<std::uint32_t>(s.sample_count);
     s.report.dx12_depth_bits = s.depth_bits;
+
+    if (s.rt_supported) {  // the shadow pass reads the depth buffer
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(s.physical_device, s.depth_format, &properties);
+        const VkSampleCountFlags sampled = s.device_properties.limits.sampledImageDepthSampleCounts &
+            image_sample_counts(s, s.depth_format,
+                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) == 0u ||
+            (sampled & s.sample_count) == 0u) {
+            rt_log("the depth buffer cannot be sampled at MSAA " +
+                             std::to_string(static_cast<std::uint32_t>(s.sample_count)) + "; shadows are off");
+            s.rt_supported = false;
+        }
+    }
 }
 
 bool create_instance(VkGeState &s, std::string &error) noexcept {
@@ -856,6 +991,8 @@ bool create_instance(VkGeState &s, std::string &error) noexcept {
     if (result != VK_SUCCESS) { error = vk_text(result, "vkCreateInstance"); return false; }
     return true;
 }
+
+void check_ray_tracing_support(VkGeState &s) noexcept;
 
 bool select_physical_device(VkGeState &s, std::string &error) noexcept {
     std::uint32_t count = 0u;
@@ -916,7 +1053,48 @@ bool select_physical_device(VkGeState &s, std::string &error) noexcept {
                 " bytes of push constants; the GE needs " + std::to_string(kPushConstantsSize);
         return false;
     }
+    check_ray_tracing_support(s);
     return true;
+}
+
+// Rendering.RayTracedShadows needs acceleration structures, ray queries and buffer device addresses.
+void check_ray_tracing_support(VkGeState &s) noexcept {
+    s.rt_supported = false;
+    if (!lcs_render_configuration().rendering.ray_traced_shadows) return;
+    std::uint32_t count = 0u;
+    vkEnumerateDeviceExtensionProperties(s.physical_device, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> extensions(count);
+    vkEnumerateDeviceExtensionProperties(s.physical_device, nullptr, &count, extensions.data());
+    const auto has = [&](const char *name) {
+        return std::any_of(extensions.begin(), extensions.end(), [&](const VkExtensionProperties &e) {
+            return std::strcmp(e.extensionName, name) == 0;
+        });
+    };
+    if (!has(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) || !has(VK_KHR_RAY_QUERY_EXTENSION_NAME) ||
+        !has(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
+        rt_log("the GPU has no ray queries; shadows are off");
+        return;
+    }
+    VkPhysicalDeviceRayQueryFeaturesKHR ray_query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR accel{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    accel.pNext = &ray_query;
+    VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    features12.pNext = &accel;
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &features12;
+    vkGetPhysicalDeviceFeatures2(s.physical_device, &features);
+    if (!accel.accelerationStructure || !ray_query.rayQuery || !features12.bufferDeviceAddress) {
+        rt_log("ray query features missing; shadows are off");
+        return;
+    }
+    VkPhysicalDeviceAccelerationStructurePropertiesKHR properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+    VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties2.pNext = &properties;
+    vkGetPhysicalDeviceProperties2(s.physical_device, &properties2);
+    s.rt_scratch_alignment = std::max<VkDeviceSize>(1u, properties.minAccelerationStructureScratchOffsetAlignment);
+    s.rt_supported = true;
 }
 
 bool create_device(VkGeState &s, std::string &error) noexcept {
@@ -935,16 +1113,46 @@ bool create_device(VkGeState &s, std::string &error) noexcept {
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.features.samplerAnisotropy = s.anisotropy_supported ? VK_TRUE : VK_FALSE;
     features.pNext = &features12;
-    const char *extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    std::vector<const char *> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    VkPhysicalDeviceRayQueryFeaturesKHR ray_query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR accel{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    if (s.rt_supported) {
+        features12.bufferDeviceAddress = VK_TRUE;
+        accel.accelerationStructure = VK_TRUE;
+        ray_query.rayQuery = VK_TRUE;
+        accel.pNext = &ray_query;
+        features13.pNext = &accel;
+        extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    }
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.pNext = &features;
     info.queueCreateInfoCount = 1u;
     info.pQueueCreateInfos = &queue;
-    info.enabledExtensionCount = 1u;
-    info.ppEnabledExtensionNames = extensions;
+    info.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
+    info.ppEnabledExtensionNames = extensions.data();
     const VkResult result = vkCreateDevice(s.physical_device, &info, nullptr, &s.device);
     if (result != VK_SUCCESS) { error = vk_text(result, "vkCreateDevice"); return false; }
     vkGetDeviceQueue(s.device, s.queue_family, 0u, &s.queue);
+    if (s.rt_supported) {
+        const auto load = [&](const char *name) { return vkGetDeviceProcAddr(s.device, name); };
+        s.rt_build_sizes = reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
+            load("vkGetAccelerationStructureBuildSizesKHR"));
+        s.rt_create = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
+            load("vkCreateAccelerationStructureKHR"));
+        s.rt_destroy = reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(
+            load("vkDestroyAccelerationStructureKHR"));
+        s.rt_cmd_build = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
+            load("vkCmdBuildAccelerationStructuresKHR"));
+        s.rt_address = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
+            load("vkGetAccelerationStructureDeviceAddressKHR"));
+        if (!s.rt_build_sizes || !s.rt_create || !s.rt_destroy || !s.rt_cmd_build || !s.rt_address) {
+            rt_log("acceleration structure functions missing; shadows are off");
+            s.rt_supported = false;
+        }
+    }
     return true;
 }
 
@@ -1099,6 +1307,9 @@ bool hardware_transform_equal(const GeGpuHardwareTransform &a,
                               const GeGpuHardwareTransform &b) noexcept {
     return a.model_to_clip == b.model_to_clip &&
            a.model_to_view_z == b.model_to_view_z &&
+           a.model_to_view == b.model_to_view &&
+           a.view == b.view &&
+           a.world == b.world &&
            a.viewport_scale_x == b.viewport_scale_x &&
            a.viewport_scale_y == b.viewport_scale_y &&
            a.viewport_scale_z == b.viewport_scale_z &&
@@ -1498,9 +1709,21 @@ bool ensure_framebuffer_target(VkGeState &s, std::uint32_t address, std::string 
         if (!target.msaa_color) return false;
     }
     target.depth = create_image(s, s.target_width, s.target_height, 1u, s.depth_format, s.sample_count,
-                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, s.depth_aspect,
-                                "framebuffer depth", error);
+                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                    (s.rt_active ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u),
+                                s.depth_aspect, "framebuffer depth", error);
     if (!target.depth) return false;
+    if (s.rt_active) {
+        auto holder = std::make_shared<ImageViewHolder>();
+        holder->device = s.device;
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image = target.depth->image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = s.depth_format;
+        view.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 1u, 0u, 1u};
+        if (vkCreateImageView(s.device, &view, nullptr, &holder->view) == VK_SUCCESS)
+            target.depth_sample = std::move(holder);
+    }
     target.srv_index = s.next_srv++;
     write_srv(s, target.srv_index, target.color->view);
 
@@ -1569,6 +1792,7 @@ struct PipelineDesc {
     VkFormat color_format{};
     VkFormat depth_format{VK_FORMAT_UNDEFINED};
     bool ge_dynamic_state{};  // blend constants and topology are set per draw
+    VkPipelineLayout layout{};  // VK_NULL_HANDLE: the GE layout
 };
 
 VkPipeline build_pipeline(VkGeState &s, const PipelineDesc &desc, std::string &error) noexcept {
@@ -1622,7 +1846,7 @@ VkPipeline build_pipeline(VkGeState &s, const PipelineDesc &desc, std::string &e
     info.pDepthStencilState = &desc.depth;
     info.pColorBlendState = &blend;
     info.pDynamicState = &dynamic_state;
-    info.layout = s.pipeline_layout;
+    info.layout = desc.layout != VK_NULL_HANDLE ? desc.layout : s.pipeline_layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult result = vkCreateGraphicsPipelines(s.device, VK_NULL_HANDLE, 1u, &info, nullptr, &pipeline);
     if (result != VK_SUCCESS) {
@@ -2473,6 +2697,7 @@ TransformConstants make_transform_constants(const VkBatch &batch, std::uint32_t 
 }
 
 void clear_accumulation(VkGeState &s) noexcept {
+    s.sun_observations.clear();
     s.vertices.clear();
     s.packed_0115_vertices.clear();
     s.indices.clear();
@@ -2480,6 +2705,764 @@ void clear_accumulation(VkGeState &s) noexcept {
 }
 
 // ---- creation / destruction --------------------------------------------------------------------
+
+// ---- ray-traced sun shadows (Rendering.RayTracedShadows) ---------------------------------------
+// Every frame the opaque 3D draws of the main framebuffer are transformed to view space on the
+// CPU and built into one acceleration structure (a PSP frame is small enough to rebuild it from
+// scratch). After the last of those draws a full-screen pass rebuilds each pixel's view-space
+// position from the depth buffer, casts one ray towards the sun (the game's directional light)
+// and darkens the pixel when something is in the way. Only what the game drew this frame can cast
+// a shadow, so objects outside the view do not.
+
+constexpr std::size_t kRtMaxTriangles = 1u << 20u;
+constexpr std::uint32_t kRtAlphaCutout = 0x20u;  // alpha-tested draws above this are cut-outs (foliage)
+constexpr float kRtShadowDistance = 250.0f;      // view-space units (metres in the game)
+
+constexpr char kRtShadowShaderGlsl[] = R"GLSL(
+#version 460
+#extension GL_EXT_ray_query : require
+#if LCS_MSAA
+layout(set = 0, binding = 0) uniform sampler2DMS DepthBuffer;
+#else
+layout(set = 0, binding = 0) uniform sampler2D DepthBuffer;
+#endif
+layout(set = 0, binding = 1) uniform accelerationStructureEXT Scene;
+layout(push_constant) uniform ShadowConstants {
+    mat4 ClipToView;  // (NDC x, y, depth, 1) -> view space
+    vec4 Sun;         // xyz towards the sun in view space, w darkening 0-1
+    vec4 Target;      // xy target size in pixels, z shadow distance, w debug
+};
+layout(location = 0) out vec4 Factor;
+
+float DepthAt(ivec2 p) { return texelFetch(DepthBuffer, clamp(p, ivec2(0), ivec2(Target.xy) - 1), 0).r; }
+
+vec3 ViewAt(ivec2 p) {
+    vec2 ndc = vec2((float(p.x) + 0.5) / Target.x * 2.0 - 1.0, 1.0 - (float(p.y) + 0.5) / Target.y * 2.0);
+    vec4 v = ClipToView * vec4(ndc, DepthAt(p), 1.0);
+    return v.xyz / v.w;
+}
+
+void main() {
+    Factor = vec4(1.0);
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    if (DepthAt(p) <= 0.0) return;  // nothing was drawn here (the depth buffer is cleared to 0)
+    vec3 position = ViewAt(p);
+    float distance = length(position);
+    if (!(distance < Target.z)) return;
+
+    // Surface normal from the neighbouring depths, taking the side that stays on the same surface.
+    vec3 dx1 = ViewAt(p + ivec2(1, 0)) - position, dx2 = position - ViewAt(p - ivec2(1, 0));
+    vec3 dy1 = ViewAt(p + ivec2(0, 1)) - position, dy2 = position - ViewAt(p - ivec2(0, 1));
+    vec3 normal = cross(dot(dx1, dx1) < dot(dx2, dx2) ? dx1 : dx2, dot(dy1, dy1) < dot(dy2, dy2) ? dy1 : dy2);
+    if (dot(normal, normal) < 1.0e-20) return;
+    normal = normalize(normal);
+    if (dot(normal, position) > 0.0) normal = -normal;  // the camera is at the origin
+
+    float lit = smoothstep(0.0, 0.2, dot(normal, Sun.xyz));
+    if (Target.w == 2.0) { Factor = vec4(vec3(lit), 1.0); return; }            // debug: facing only
+    if (Target.w == 3.0) { Factor = vec4(normal * 0.5 + 0.5, 1.0); return; }    // debug: normals
+    if (Target.w == 4.0) lit = 1.0;                                             // debug: occlusion only
+    if (lit > 0.0) {
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, Scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
+                              position + normal * (0.03 + distance * 0.002), 0.0, Sun.xyz, Target.z);
+        while (rayQueryProceedEXT(query)) {}
+        if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT) lit = 0.0;
+    }
+    float fade = 1.0 - smoothstep(Target.z * 0.7, Target.z, distance);
+    float k = Target.w > 0.0 ? lit : 1.0 - Sun.w * (1.0 - lit) * fade;
+    Factor = vec4(k, k, k, 1.0);
+}
+)GLSL";
+
+VkShaderModule compile_glsl(VkGeState &s, const char *source, const char *name, shaderc_shader_kind kind,
+                            bool msaa, std::string &error) noexcept {
+    shaderc_compile_options_t options = shaderc_compile_options_initialize();
+    shaderc_compile_options_set_source_language(options, shaderc_source_language_glsl);
+    shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
+    shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_performance);
+    shaderc_compile_options_add_macro_definition(options, "LCS_MSAA", 8u, msaa ? "1" : "0", 1u);
+    shaderc_compilation_result_t result = shaderc_compile_into_spv(
+        s.shader_compiler, source, std::strlen(source), kind, name, "main", options);
+    shaderc_compile_options_release(options);
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (result == nullptr ||
+        shaderc_result_get_compilation_status(result) != shaderc_compilation_status_success) {
+        error = std::string("shader ") + name + ": " +
+                (result != nullptr ? shaderc_result_get_error_message(result) : "shaderc failed");
+    } else {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = shaderc_result_get_length(result);
+        info.pCode = reinterpret_cast<const std::uint32_t *>(shaderc_result_get_bytes(result));
+        const VkResult created = vkCreateShaderModule(s.device, &info, nullptr, &module);
+        if (created != VK_SUCCESS) {
+            error = vk_text(created, "vkCreateShaderModule");
+            module = VK_NULL_HANDLE;
+        }
+    }
+    if (result != nullptr) shaderc_result_release(result);
+    return module;
+}
+
+RtBufferPtr rt_create_buffer(VkGeState &s, VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible,
+                             const char *what, std::string &error) {
+    auto buffer = std::make_shared<RtBuffer>();
+    buffer->device = s.device;
+    buffer->size = size;
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = size;
+    info.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult result = vkCreateBuffer(s.device, &info, nullptr, &buffer->buffer);
+    if (result != VK_SUCCESS) { error = vk_text(result, what); return {}; }
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(s.device, buffer->buffer, &requirements);
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.pNext = &flags;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = host_visible
+        ? find_memory_type(s, requirements.memoryTypeBits,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        : find_memory_type(s, requirements.memoryTypeBits, 0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (allocate.memoryTypeIndex == 0xFFFFFFFFu) {
+        error = std::string(what) + ": no suitable memory type";
+        return {};
+    }
+    result = vkAllocateMemory(s.device, &allocate, nullptr, &buffer->memory);
+    if (result != VK_SUCCESS) { error = vk_text(result, what); return {}; }
+    result = vkBindBufferMemory(s.device, buffer->buffer, buffer->memory, 0u);
+    if (result != VK_SUCCESS) { error = vk_text(result, what); return {}; }
+    if (host_visible) {
+        void *mapped = nullptr;
+        result = vkMapMemory(s.device, buffer->memory, 0u, VK_WHOLE_SIZE, 0u, &mapped);
+        if (result != VK_SUCCESS || mapped == nullptr) { error = vk_text(result, what); return {}; }
+        buffer->mapped = static_cast<std::byte *>(mapped);
+    }
+    VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    address.buffer = buffer->buffer;
+    buffer->address = vkGetBufferDeviceAddress(s.device, &address);
+    return buffer;
+}
+
+// Keeps `buffer` when it holds `size` bytes, otherwise replaces it with a larger one.
+bool rt_ensure_buffer(VkGeState &s, RtBufferPtr &buffer, VkDeviceSize size, VkBufferUsageFlags usage,
+                      bool host_visible, const char *what, std::string &error) {
+    if (buffer && buffer->size >= size) return true;
+    buffer = rt_create_buffer(s, std::max<VkDeviceSize>(size + size / 2u, 4096u), usage, host_visible, what, error);
+    return buffer != nullptr;
+}
+
+std::shared_ptr<RtAccel> rt_create_accel(VkGeState &s, const RtBufferPtr &storage, VkDeviceSize size,
+                                         VkAccelerationStructureTypeKHR type, std::string &error) {
+    auto accel = std::make_shared<RtAccel>();
+    accel->device = s.device;
+    accel->destroy = s.rt_destroy;
+    accel->size = size;
+    accel->storage = storage;
+    VkAccelerationStructureCreateInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+    info.buffer = storage->buffer;
+    info.size = size;
+    info.type = type;
+    const VkResult result = s.rt_create(s.device, &info, nullptr, &accel->handle);
+    if (result != VK_SUCCESS) { error = vk_text(result, "vkCreateAccelerationStructureKHR"); return {}; }
+    VkAccelerationStructureDeviceAddressInfoKHR address{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+    address.accelerationStructure = accel->handle;
+    accel->address = s.rt_address(s.device, &address);
+    return accel;
+}
+
+void rt_memory_barrier(VkCommandBuffer cmd) noexcept {
+    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.memoryBarrierCount = 1u;
+    dependency.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
+// Creates the shadow pass (layout, descriptors, shader, pipeline). A failure only turns shadows off.
+bool rt_create_resources(VkGeState &s, std::string &error) noexcept {
+    const VkDescriptorSetLayoutBinding bindings[]{
+        {0u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {1u, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layout.bindingCount = 2u;
+    layout.pBindings = bindings;
+    VkResult result = vkCreateDescriptorSetLayout(s.device, &layout, nullptr, &s.rt_set_layout);
+    if (result != VK_SUCCESS) { error = vk_text(result, "vkCreateDescriptorSetLayout(shadows)"); return false; }
+    const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0u, sizeof(RtShadowConstants)};
+    VkPipelineLayoutCreateInfo pipeline_layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipeline_layout.setLayoutCount = 1u;
+    pipeline_layout.pSetLayouts = &s.rt_set_layout;
+    pipeline_layout.pushConstantRangeCount = 1u;
+    pipeline_layout.pPushConstantRanges = &push;
+    result = vkCreatePipelineLayout(s.device, &pipeline_layout, nullptr, &s.rt_pipeline_layout);
+    if (result != VK_SUCCESS) { error = vk_text(result, "vkCreatePipelineLayout(shadows)"); return false; }
+
+    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFrameCount},
+                                       {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kFrameCount}};
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = kFrameCount;
+    pool.poolSizeCount = 2u;
+    pool.pPoolSizes = sizes;
+    result = vkCreateDescriptorPool(s.device, &pool, nullptr, &s.rt_descriptor_pool);
+    if (result != VK_SUCCESS) { error = vk_text(result, "vkCreateDescriptorPool(shadows)"); return false; }
+    for (RtFrame &frame : s.rt_frames) {
+        VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocate.descriptorPool = s.rt_descriptor_pool;
+        allocate.descriptorSetCount = 1u;
+        allocate.pSetLayouts = &s.rt_set_layout;
+        result = vkAllocateDescriptorSets(s.device, &allocate, &frame.set);
+        if (result != VK_SUCCESS) { error = vk_text(result, "vkAllocateDescriptorSets(shadows)"); return false; }
+    }
+
+    VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sampler.magFilter = VK_FILTER_NEAREST;
+    sampler.minFilter = VK_FILTER_NEAREST;
+    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.maxAnisotropy = 1.0f;
+    result = vkCreateSampler(s.device, &sampler, nullptr, &s.rt_sampler);
+    if (result != VK_SUCCESS) { error = vk_text(result, "vkCreateSampler(shadows)"); return false; }
+
+    s.rt_shader = compile_glsl(s, kRtShadowShaderGlsl, "LCSNativeVulkanShadows", shaderc_fragment_shader,
+                               s.sample_count != VK_SAMPLE_COUNT_1_BIT, error);
+    if (s.rt_shader == VK_NULL_HANDLE) return false;
+
+    // One invocation per pixel; the factor multiplies every sample of the (MSAA) colour target.
+    PipelineDesc desc;
+    desc.vs = s.present_vertex_shader;
+    desc.vs_entry = "PresentVS";
+    desc.ps = s.rt_shader;
+    desc.ps_entry = "main";
+    desc.samples = s.sample_count;
+    desc.blend.blendEnable = VK_TRUE;
+    desc.blend.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    desc.blend.dstColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR;
+    desc.blend.colorBlendOp = VK_BLEND_OP_ADD;
+    desc.blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    desc.blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    desc.blend.alphaBlendOp = VK_BLEND_OP_ADD;
+    desc.blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+    desc.color_format = scene_format();
+    desc.layout = s.rt_pipeline_layout;
+    s.rt_pipeline = build_pipeline(s, desc, error);
+    return s.rt_pipeline != VK_NULL_HANDLE;
+}
+
+void rt_destroy_resources(VkGeState &s) noexcept {
+    for (RtFrame &frame : s.rt_frames) frame = {};
+    if (s.rt_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(s.device, s.rt_pipeline, nullptr);
+    if (s.rt_shader != VK_NULL_HANDLE) vkDestroyShaderModule(s.device, s.rt_shader, nullptr);
+    if (s.rt_sampler != VK_NULL_HANDLE) vkDestroySampler(s.device, s.rt_sampler, nullptr);
+    if (s.rt_descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(s.device, s.rt_descriptor_pool, nullptr);
+    if (s.rt_pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(s.device, s.rt_pipeline_layout, nullptr);
+    if (s.rt_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(s.device, s.rt_set_layout, nullptr);
+    s.rt_pipeline = VK_NULL_HANDLE;
+    s.rt_shader = VK_NULL_HANDLE;
+    s.rt_sampler = VK_NULL_HANDLE;
+    s.rt_descriptor_pool = VK_NULL_HANDLE;
+    s.rt_pipeline_layout = VK_NULL_HANDLE;
+    s.rt_set_layout = VK_NULL_HANDLE;
+    s.rt_active = false;
+}
+
+// Draws that write depth in 3D (not through mode). Cut-out alpha-tested draws (foliage, fences)
+// still mark where the pass goes but cast no shadow: the rays do not read textures.
+bool rt_scene_batch(const VkBatch &batch) noexcept {
+    const GeGpuDrawDescriptor &draw = batch.draw;
+    return batch.hardware_transform && !draw.through && !draw.clear_mode && draw.depth_write_enabled;
+}
+bool rt_caster_batch(const VkBatch &batch) noexcept {
+    return rt_scene_batch(batch) &&
+           !(batch.draw.alpha_test_enabled && (batch.draw.alpha_reference & 0xFFu) > kRtAlphaCutout);
+}
+
+// Appends the batch's triangles, transformed by `m` (column-major), to `out`.
+void rt_append_triangles(const VkGeState &s, const VkBatch &batch, const std::array<float, 16> &m,
+                         std::vector<float> &out) {
+    const auto position = [&](std::uint32_t vertex, float *out) {
+        float x = 0.0f, y = 0.0f, z = 0.0f, w = 1.0f;
+        if (batch.packed_0115) {
+            const std::size_t offset = static_cast<std::size_t>(vertex) * 10u;
+            if (offset + 10u > s.packed_0115_vertices.size()) return false;
+            std::int16_t xyz[3]{};
+            std::memcpy(xyz, s.packed_0115_vertices.data() + offset + 4u, sizeof(xyz));
+            x = xyz[0] * (1.0f / 32768.0f);
+            y = xyz[1] * (1.0f / 32768.0f);
+            z = xyz[2] * (1.0f / 32768.0f);
+        } else {
+            if (vertex >= s.vertices.size()) return false;
+            const UploadVertex &v = s.vertices[vertex];
+            x = v.x;
+            y = v.y;
+            z = v.z;
+            w = v.w;
+        }
+        for (std::size_t row = 0u; row < 3u; ++row)
+            out[row] = m[row] * x + m[4u + row] * y + m[8u + row] * z + m[12u + row] * w;
+        return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+    };
+    const std::uint32_t count = batch.indexed ? batch.index_count : batch.vertex_count;
+    if (batch.indexed && static_cast<std::size_t>(batch.first_index) + count > s.indices.size()) return;
+    const auto vertex_at = [&](std::uint32_t i) {
+        return batch.first_vertex + (batch.indexed ? s.indices[batch.first_index + i] : i);
+    };
+    const bool strip = batch.transform.primitive == 4u;
+    const std::uint32_t triangles = strip ? (count >= 3u ? count - 2u : 0u) : count / 3u;
+    float corner[9];
+    for (std::uint32_t t = 0u; t < triangles; ++t) {
+        const std::uint32_t first = strip ? t : t * 3u;
+        if (!position(vertex_at(first), corner) || !position(vertex_at(first + 1u), corner + 3) ||
+            !position(vertex_at(first + 2u), corner + 6))
+            continue;
+        out.insert(out.end(), corner, corner + 9);
+    }
+}
+
+std::array<float, 16> affine_to_matrix(const std::array<float, 12> &m) noexcept {
+    return {m[0], m[1], m[2], 0.0f, m[3], m[4], m[5], 0.0f, m[6], m[7], m[8], 0.0f, m[9], m[10], m[11], 1.0f};
+}
+
+// Identifies an object across frames: its world matrix, primitive layout and a sample of its vertices.
+std::uint64_t rt_mesh_key(const VkGeState &s, const VkBatch &batch) noexcept {
+    std::uint64_t hash = 0xCBF29CE484222325ull;
+    const auto mix = [&](std::uint64_t value) { hash = hash_mix(hash, value); };
+    for (float value : batch.transform.world) mix(std::bit_cast<std::uint32_t>(value));
+    const std::uint32_t count = batch.indexed ? batch.index_count : batch.vertex_count;
+    mix(count);
+    mix((batch.packed_0115 ? 1u : 0u) | (batch.indexed ? 2u : 0u) | (batch.transform.primitive << 2u));
+    const std::uint32_t step = std::max<std::uint32_t>(1u, count / 16u);
+    for (std::uint32_t i = 0u; i < count; i += step) {
+        std::uint32_t vertex = i;
+        if (batch.indexed) {
+            if (static_cast<std::size_t>(batch.first_index) + i >= s.indices.size()) break;
+            vertex = s.indices[batch.first_index + i];
+            mix(vertex);
+        }
+        vertex += batch.first_vertex;
+        if (batch.packed_0115) {
+            const std::size_t offset = static_cast<std::size_t>(vertex) * 10u;
+            if (offset + 10u > s.packed_0115_vertices.size()) break;
+            std::uint64_t bytes = 0u;  // the position only: vertex colours change with the time of day
+            std::memcpy(&bytes, s.packed_0115_vertices.data() + offset + 4u, 6u);
+            mix(bytes);
+        } else {
+            if (vertex >= s.vertices.size()) break;
+            const UploadVertex &v = s.vertices[vertex];
+            mix(std::bit_cast<std::uint32_t>(v.x) | (std::uint64_t{std::bit_cast<std::uint32_t>(v.y)} << 32u));
+            mix(std::bit_cast<std::uint32_t>(v.z));
+        }
+    }
+    return hash;
+}
+
+bool invert_matrix(const std::array<float, 16> &m, std::array<float, 16> &out) noexcept {
+    std::array<float, 16> inv{};
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    const float determinant = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (!std::isfinite(determinant) || std::abs(determinant) < 1.0e-30f) return false;
+    for (std::size_t i = 0u; i < 16u; ++i) out[i] = inv[i] / determinant;
+    return true;
+}
+
+// Captures this frame's scene, uploads it and records the acceleration structure builds (outside
+// any rendering scope). Sets s.rt_pass_before when the shadow pass should be drawn.
+void rt_prepare_frame(VkGeState &s, std::uint32_t slot, VkCommandBuffer cmd) noexcept {
+    s.rt_pass_before = std::numeric_limits<std::size_t>::max();
+    if (!s.rt_active) return;
+    static const float debug = [] {
+        const char *text = std::getenv("LCS_RT_DEBUG");
+        return text != nullptr ? static_cast<float>(std::atof(text)) : 0.0f;
+    }();
+
+    // The main scene is the framebuffer that received the most 3D geometry.
+    std::unordered_map<std::uint32_t, std::uint64_t> scene_vertices;
+    for (const VkBatch &batch : s.batches)
+        if (rt_scene_batch(batch))
+            scene_vertices[batch.draw.framebuffer_address & 0x001FFFF0u] +=
+                batch.indexed ? batch.index_count : batch.vertex_count;
+    std::uint32_t address = 0u;
+    std::uint64_t most = 0u;
+    for (const auto &[candidate, vertices] : scene_vertices)
+        if (vertices > most) { most = vertices; address = candidate; }
+    FramebufferTarget *target = find_framebuffer_target(s, address);
+    if (most == 0u || target == nullptr || !target->depth_sample) return;
+
+    // The camera is the one of the largest shadow-casting draw.
+    std::size_t last_scene_batch = std::numeric_limits<std::size_t>::max();
+    const VkBatch *camera = nullptr;
+    std::uint32_t camera_vertices = 0u;
+    for (std::size_t i = 0u; i < s.batches.size(); ++i) {
+        const VkBatch &batch = s.batches[i];
+        if (!rt_scene_batch(batch) || (batch.draw.framebuffer_address & 0x001FFFF0u) != address) continue;
+        last_scene_batch = i;
+        const std::uint32_t vertices = batch.indexed ? batch.index_count : batch.vertex_count;
+        if (rt_caster_batch(batch) && vertices > camera_vertices) {
+            camera_vertices = vertices;
+            camera = &batch;
+        }
+    }
+    if (camera == nullptr) return;
+    const std::array<float, 12> &view = camera->transform.view;
+
+    // view -> framebuffer mapping: clip = T * model and view = M * model, so clip = T * M^-1 * view.
+    const std::uint32_t logical_width = target->logical_width != 0u ? target->logical_width : kReferenceWidth;
+    const std::uint32_t logical_height = target->logical_height != 0u ? target->logical_height : kReferenceHeight;
+    const TransformConstants constants = make_transform_constants(*camera, logical_width, logical_height);
+    const std::array<std::array<float, 4>, 4> rows{constants.row0, constants.row1, constants.row2, constants.row3};
+    std::array<float, 16> view_to_model{};
+    if (!invert_matrix(camera->transform.model_to_view, view_to_model)) return;
+    std::array<float, 16> view_to_clip{};
+    for (std::size_t c = 0u; c < 4u; ++c)
+        for (std::size_t r = 0u; r < 4u; ++r) {
+            float sum = 0.0f;
+            for (std::size_t k = 0u; k < 4u; ++k) sum += rows[r][k] * view_to_model[c * 4u + k];
+            view_to_clip[c * 4u + r] = sum;
+        }
+    std::array<float, 16> clip_to_view{};
+    if (!invert_matrix(view_to_clip, clip_to_view)) return;
+    const std::array<float, 16> world_to_view = affine_to_matrix(view);
+    std::array<float, 16> world_to_clip{};
+    for (std::size_t c = 0u; c < 4u; ++c)
+        for (std::size_t r = 0u; r < 4u; ++r) {
+            float sum = 0.0f;
+            for (std::size_t k = 0u; k < 4u; ++k) sum += view_to_clip[k * 4u + r] * world_to_view[c * 4u + k];
+            world_to_clip[c * 4u + r] = sum;
+        }
+    std::array<float, 16> view_to_world{};
+    if (!invert_matrix(world_to_view, view_to_world)) return;
+    const std::array<float, 3> eye{view_to_world[12], view_to_world[13], view_to_world[14]};
+
+    // Update the object cache with this frame's draws.
+    const std::uint64_t frame_number = ++s.rt_cache_frame;
+    std::size_t created = 0u;
+    try {
+        for (const VkBatch &batch : s.batches) {
+            if (!rt_caster_batch(batch) || batch.transform.view != view ||
+                (batch.draw.framebuffer_address & 0x001FFFF0u) != address)
+                continue;
+            const std::uint64_t key = rt_mesh_key(s, batch);
+            auto found = s.rt_cache.find(key);
+            if (found != s.rt_cache.end()) {
+                VkGeState::RtCachedMesh &mesh = found->second;
+                if (mesh.last_seen == frame_number) continue;  // the same object drawn twice
+                ++mesh.seen;
+                mesh.last_seen = frame_number;
+                continue;
+            }
+            VkGeState::RtCachedMesh mesh;
+            rt_append_triangles(s, batch, affine_to_matrix(batch.transform.world), mesh.triangles);
+            if (mesh.triangles.empty()) continue;
+            mesh.low = {mesh.triangles[0], mesh.triangles[1], mesh.triangles[2]};
+            mesh.high = mesh.low;
+            for (std::size_t i = 0u; i < mesh.triangles.size(); i += 3u)
+                for (std::size_t axis = 0u; axis < 3u; ++axis) {
+                    mesh.low[axis] = std::min(mesh.low[axis], mesh.triangles[i + axis]);
+                    mesh.high[axis] = std::max(mesh.high[axis], mesh.triangles[i + axis]);
+                }
+            mesh.last_seen = frame_number;
+            mesh.seen = 1u;
+            s.rt_cache_triangles += mesh.triangles.size() / 9u;
+            s.rt_cache.emplace(key, std::move(mesh));
+            ++created;
+        }
+    } catch (...) {
+        return;
+    }
+
+    // Objects drawn this frame cast shadows. An object not drawn is remembered when it was drawn for a
+    // while (a moving car or ped is a new object every frame) and is near enough to shade the view,
+    // and it casts shadows while it is outside the view, where the game skips it. Inside the view the
+    // game may skip a building (level of detail, occlusion) that is still there, so buildings are
+    // kept; a small object the game no longer draws in view (a car that left) is forgotten.
+    const auto outside_view = [&](const VkGeState::RtCachedMesh &mesh) {
+        std::array<std::uint32_t, 5> outside{};
+        for (std::uint32_t corner = 0u; corner < 8u; ++corner) {
+            const float p[3]{(corner & 1u) ? mesh.high[0] : mesh.low[0], (corner & 2u) ? mesh.high[1] : mesh.low[1],
+                             (corner & 4u) ? mesh.high[2] : mesh.low[2]};
+            float clip[4];
+            for (std::size_t r = 0u; r < 4u; ++r)
+                clip[r] = world_to_clip[r] * p[0] + world_to_clip[4u + r] * p[1] + world_to_clip[8u + r] * p[2] +
+                          world_to_clip[12u + r];
+            outside[0] += clip[0] < -clip[3];
+            outside[1] += clip[0] > clip[3];
+            outside[2] += clip[1] < -clip[3];
+            outside[3] += clip[1] > clip[3];
+            outside[4] += clip[3] <= 0.0f;
+        }
+        return std::any_of(outside.begin(), outside.end(), [](std::uint32_t n) { return n == 8u; });
+    };
+    const auto distance_to = [&](const VkGeState::RtCachedMesh &mesh) {
+        float squared = 0.0f;
+        for (std::size_t axis = 0u; axis < 3u; ++axis) {
+            const float d = std::max({mesh.low[axis] - eye[axis], 0.0f, eye[axis] - mesh.high[axis]});
+            squared += d * d;
+        }
+        return std::sqrt(squared);
+    };
+    constexpr std::uint32_t kStableFrames = 4u;
+    constexpr std::uint64_t kForgetFrames = 36000u;  // about five minutes at 120 fps
+    constexpr float kSmallObject = 15.0f;            // bounding box diagonal of cars and peds (metres)
+    s.rt_positions.clear();
+    for (auto it = s.rt_cache.begin(); it != s.rt_cache.end();) {
+        VkGeState::RtCachedMesh &mesh = it->second;
+        bool keep = true;
+        bool include = mesh.last_seen == frame_number;
+        if (!include) {
+            const float distance = distance_to(mesh);
+            const float dx = mesh.high[0] - mesh.low[0], dy = mesh.high[1] - mesh.low[1], dz = mesh.high[2] - mesh.low[2];
+            const bool small = dx * dx + dy * dy + dz * dz < kSmallObject * kSmallObject;
+            const bool outside = outside_view(mesh);
+            keep = mesh.seen >= kStableFrames && frame_number - mesh.last_seen < kForgetFrames &&
+                   distance < kRtShadowDistance * 2.0f && (outside || !small);
+            include = keep && outside && distance < kRtShadowDistance;
+        }
+        if (include && s.rt_positions.size() / 9u + mesh.triangles.size() / 9u <= kRtMaxTriangles)
+            s.rt_positions.insert(s.rt_positions.end(), mesh.triangles.begin(), mesh.triangles.end());
+        if (keep) {
+            ++it;
+        } else {
+            s.rt_cache_triangles -= mesh.triangles.size() / 9u;
+            it = s.rt_cache.erase(it);
+        }
+    }
+    const std::uint32_t triangle_count = static_cast<std::uint32_t>(s.rt_positions.size() / 9u);
+    if (triangle_count == 0u) return;
+    static const bool trace = env_flag("LCS_RT_TRACE", false);
+    if (trace && frame_number % 120u == 0u) {
+        std::size_t drawn = 0u, kept = 0u, drawn_outside = 0u;
+        for (const auto &[key, mesh] : s.rt_cache) {
+            (mesh.last_seen == frame_number ? drawn : kept) += 1u;
+            if (mesh.last_seen == frame_number && outside_view(mesh)) ++drawn_outside;
+        }
+        rt_log("new objects this frame: " + std::to_string(created) +
+               ", drawn but outside the view test: " + std::to_string(drawn_outside));
+        rt_log("frame " + std::to_string(s.report.game_frames) + ": " + std::to_string(triangle_count) +
+               " triangles, objects drawn " + std::to_string(drawn) + ", kept from earlier frames " +
+               std::to_string(kept) + ", cache " + std::to_string(s.rt_cache_triangles) + " triangles");
+    }
+
+    // The sun is a light of a lit draw seen through the main camera (HUD models have their own).
+    // The game also lights characters from the side of the camera with a horizontal light, so only
+    // a light from above the horizon counts; frames without one keep the last sun.
+    const VkGeState::SunObservation *sun = nullptr;
+    for (const VkGeState::SunObservation &seen : s.sun_observations)
+        if (seen.view == view && seen.world[2] > 0.02f && (sun == nullptr || seen.intensity > sun->intensity))
+            sun = &seen;
+    if (sun != nullptr) {
+        s.sun_world = sun->world;
+        s.sun_intensity = sun->intensity;
+        s.sun_seen = true;
+    }
+    // LCS_RT_TRACE=1: the lights seen (the sun is picked from them) and the cached objects
+    if (trace && s.report.game_frames % 600u == 0u) {
+        std::ostringstream log;
+        log << "frame " << s.report.game_frames << " sun world=(" << s.sun_world[0] << ',' << s.sun_world[1] << ','
+            << s.sun_world[2] << ") lights:";
+        for (const VkGeState::SunObservation &seen : s.sun_observations)
+            log << (seen.view == view ? " [main " : " [other ") << seen.world[0] << ',' << seen.world[1] << ','
+                << seen.world[2] << " i=" << seen.intensity << ']';
+        rt_log(log.str());
+    }
+    if (!s.sun_seen) return;
+    // Weaker as the light dims (dusk, night) and gone once the sun is below the horizon (+z is up).
+    const float darkening = lcs_post_settings().shadow_strength.load(std::memory_order_relaxed) *
+                            std::clamp(s.sun_intensity * 2.0f, 0.0f, 1.0f) *
+                            std::clamp(s.sun_world[2] * 4.0f, 0.0f, 1.0f);
+    if (darkening <= 0.001f && debug == 0.0f) return;
+    std::array<float, 3> sun_view{
+        view[0] * s.sun_world[0] + view[3] * s.sun_world[1] + view[6] * s.sun_world[2],
+        view[1] * s.sun_world[0] + view[4] * s.sun_world[1] + view[7] * s.sun_world[2],
+        view[2] * s.sun_world[0] + view[5] * s.sun_world[1] + view[8] * s.sun_world[2]};
+    const float sun_length = std::sqrt(sun_view[0] * sun_view[0] + sun_view[1] * sun_view[1] +
+                                       sun_view[2] * sun_view[2]);
+    if (!(sun_length > 1.0e-6f)) return;
+    for (float &component : sun_view) component /= sun_length;
+
+    RtFrame &frame = s.rt_frames[slot];
+    std::string error;
+    const VkDeviceSize position_bytes = static_cast<VkDeviceSize>(s.rt_positions.size()) * sizeof(float);
+    if (!rt_ensure_buffer(s, frame.positions, position_bytes,
+                          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true,
+                          "shadow scene vertices", error) ||
+        !rt_ensure_buffer(s, frame.instances, sizeof(VkAccelerationStructureInstanceKHR),
+                          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true,
+                          "shadow scene instance", error)) {
+        rt_log(error);
+        return;
+    }
+    std::memcpy(frame.positions->mapped, s.rt_positions.data(), static_cast<std::size_t>(position_bytes));
+
+    VkAccelerationStructureGeometryKHR triangles{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    triangles.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    triangles.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    auto &mesh = triangles.geometry.triangles;
+    mesh.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    mesh.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    mesh.vertexData.deviceAddress = frame.positions->address;
+    mesh.vertexStride = 3u * sizeof(float);
+    mesh.maxVertex = triangle_count * 3u - 1u;
+    mesh.indexType = VK_INDEX_TYPE_NONE_KHR;
+    VkAccelerationStructureBuildGeometryInfoKHR blas{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    blas.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    blas.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+    blas.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    blas.geometryCount = 1u;
+    blas.pGeometries = &triangles;
+    VkAccelerationStructureBuildSizesInfoKHR blas_sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    s.rt_build_sizes(s.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &blas, &triangle_count, &blas_sizes);
+
+    VkAccelerationStructureGeometryKHR instance{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    instance.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    instance.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    instance.geometry.instances.data.deviceAddress = frame.instances->address;
+    VkAccelerationStructureBuildGeometryInfoKHR tlas{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    tlas.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tlas.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    tlas.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    tlas.geometryCount = 1u;
+    tlas.pGeometries = &instance;
+    const std::uint32_t one = 1u;
+    VkAccelerationStructureBuildSizesInfoKHR tlas_sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    s.rt_build_sizes(s.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tlas, &one, &tlas_sizes);
+
+    const VkDeviceSize scratch_bytes = std::max(blas_sizes.buildScratchSize, tlas_sizes.buildScratchSize) +
+                                       s.rt_scratch_alignment;
+    if (!rt_ensure_buffer(s, frame.scratch, scratch_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
+                          "shadow scratch", error) ||
+        !rt_ensure_buffer(s, frame.blas_storage, blas_sizes.accelerationStructureSize,
+                          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false, "shadow BLAS", error) ||
+        !rt_ensure_buffer(s, frame.tlas_storage, tlas_sizes.accelerationStructureSize,
+                          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false, "shadow TLAS", error)) {
+        rt_log(error);
+        return;
+    }
+    // The structures fill their whole storage buffer, so they are recreated when it grows.
+    if (!frame.blas || frame.blas->size != frame.blas_storage->size)
+        frame.blas = rt_create_accel(s, frame.blas_storage, frame.blas_storage->size,
+                                     VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, error);
+    if (frame.blas && (!frame.tlas || frame.tlas->size != frame.tlas_storage->size))
+        frame.tlas = rt_create_accel(s, frame.tlas_storage, frame.tlas_storage->size,
+                                     VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, error);
+    if (!frame.blas || !frame.tlas) {
+        rt_log(error);
+        frame.blas.reset();
+        frame.tlas.reset();
+        return;
+    }
+
+    // The triangles are in world space; the instance moves them into view space, where the shader traces.
+    VkAccelerationStructureInstanceKHR instance_data{};
+    for (std::size_t r = 0u; r < 3u; ++r)
+        for (std::size_t c = 0u; c < 4u; ++c) instance_data.transform.matrix[r][c] = world_to_view[c * 4u + r];
+    instance_data.mask = 0xFFu;
+    instance_data.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    instance_data.accelerationStructureReference = frame.blas->address;
+    std::memcpy(frame.instances->mapped, &instance_data, sizeof(instance_data));
+
+    const VkDeviceAddress scratch = (frame.scratch->address + s.rt_scratch_alignment - 1u) &
+                                    ~(s.rt_scratch_alignment - 1u);
+    blas.dstAccelerationStructure = frame.blas->handle;
+    blas.scratchData.deviceAddress = scratch;
+    const VkAccelerationStructureBuildRangeInfoKHR blas_range{triangle_count, 0u, 0u, 0u};
+    const VkAccelerationStructureBuildRangeInfoKHR *blas_ranges = &blas_range;
+    s.rt_cmd_build(cmd, 1u, &blas, &blas_ranges);
+    rt_memory_barrier(cmd);
+    tlas.dstAccelerationStructure = frame.tlas->handle;
+    tlas.scratchData.deviceAddress = scratch;
+    const VkAccelerationStructureBuildRangeInfoKHR tlas_range{1u, 0u, 0u, 0u};
+    const VkAccelerationStructureBuildRangeInfoKHR *tlas_ranges = &tlas_range;
+    s.rt_cmd_build(cmd, 1u, &tlas, &tlas_ranges);
+    rt_memory_barrier(cmd);
+
+    const VkDescriptorImageInfo depth{s.rt_sampler, target->depth_sample->view,
+                                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSetAccelerationStructureKHR scene{
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+    scene.accelerationStructureCount = 1u;
+    scene.pAccelerationStructures = &frame.tlas->handle;
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = frame.set;
+    writes[0].dstBinding = 0u;
+    writes[0].descriptorCount = 1u;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = &depth;
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].pNext = &scene;
+    writes[1].dstSet = frame.set;
+    writes[1].dstBinding = 1u;
+    writes[1].descriptorCount = 1u;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    vkUpdateDescriptorSets(s.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0u, nullptr);
+
+    s.rt_constants.clip_to_view = clip_to_view;
+    s.rt_constants.sun = {sun_view[0], sun_view[1], sun_view[2], darkening};
+    s.rt_constants.target = {static_cast<float>(s.target_width), static_cast<float>(s.target_height),
+                             kRtShadowDistance, debug};
+    s.rt_target = address;
+    s.rt_pass_before = last_scene_batch + 1u;
+    if (s.rt_frames_traced++ == 0u) {
+        std::ostringstream log;
+        log << triangle_count << " triangles (" << s.rt_cache.size() << " cached objects), target=0x" << std::hex << address
+            << std::dec << ", sun view=(" << sun_view[0] << ',' << sun_view[1] << ',' << sun_view[2]
+            << ") world z=" << s.sun_world[2] << " intensity=" << s.sun_intensity << " darkening=" << darkening;
+        rt_log(log.str());
+    }
+}
+
+// Multiplies the target's colour by the shadow factor; leaves `target` open for rendering again.
+void rt_record_shadow_pass(VkGeState &s, VkCommandBuffer cmd, FramebufferTarget &target, std::uint32_t slot) noexcept {
+    end_rendering(s, cmd);
+    transition(cmd, target.depth, target.depth_layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = render_view(target);
+    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea = {{0, 0}, {s.target_width, s.target_height}};
+    info.layerCount = 1u;
+    info.colorAttachmentCount = 1u;
+    info.pColorAttachments = &color;
+    vkCmdBeginRendering(cmd, &info);
+    set_scene_viewport(s, cmd);
+    vkCmdSetScissor(cmd, 0u, 1u, &info.renderArea);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.rt_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.rt_pipeline_layout, 0u, 1u,
+                            &s.rt_frames[slot].set, 0u, nullptr);
+    vkCmdPushConstants(cmd, s.rt_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0u, sizeof(RtShadowConstants),
+                       &s.rt_constants);
+    vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
+    vkCmdEndRendering(cmd);
+    transition(cmd, target.depth, target.depth_layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    begin_rendering(s, cmd, target, false, false);
+}
 
 bool create_backend(VkGeState &s, std::string &error) noexcept {
     const InternalResolutionDimensions dims = resolve_internal_resolution(lcs_render_configuration().rendering);
@@ -2532,6 +3515,16 @@ bool create_backend(VkGeState &s, std::string &error) noexcept {
 
     if (!create_pipeline_layout(s, error)) return false;
     if (!compile_shaders(s, error)) return false;
+    if (s.rt_supported) {
+        std::string rt_error;
+        s.rt_active = rt_create_resources(s, rt_error);
+        if (s.rt_active) {
+            rt_log("enabled");
+        } else {
+            rt_log(rt_error);
+            rt_destroy_resources(s);
+        }
+    }
     if (!create_targets(s, error)) return false;
     s.vertices.reserve(262144u);
     s.packed_0115_vertices.reserve(2621440u);
@@ -2551,6 +3544,7 @@ void destroy_backend(VkGeState &s) noexcept {
     if (s.device != VK_NULL_HANDLE) (void)vkDeviceWaitIdle(s.device);
     destroy_swapchain(s);
     if (s.device != VK_NULL_HANDLE) {
+        rt_destroy_resources(s);
         for (FrameResources &frame : s.frames) {
             if (frame.image_available != VK_NULL_HANDLE) vkDestroySemaphore(s.device, frame.image_available, nullptr);
             frame = {};
@@ -2627,7 +3621,24 @@ std::uint32_t record_batches(VkGeState &s, FrameResources &frame, std::size_t pa
     bool active_vertex_layout_valid = false;
     VkPrimitiveTopology active_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
 
-    for (const VkBatch &batch : s.batches) {
+    const auto shadow_pass = [&]() {
+        if (current_target == nullptr || current_address != s.rt_target) return;
+        rt_record_shadow_pass(s, cmd, *current_target, s.frame_cursor);
+        // the pass bound its own pipeline, layout, descriptors and scissor
+        active_pipeline = VK_NULL_HANDLE;
+        active_pipeline_key = std::numeric_limits<std::uint64_t>::max();
+        bound_srv = std::numeric_limits<std::uint32_t>::max();
+        bound_sampler = std::numeric_limits<std::uint32_t>::max();
+        active_transform_valid = false;
+        active_pixel_valid = false;
+        active_scissor_valid = false;
+        active_blend_fix = std::numeric_limits<std::uint32_t>::max();
+        active_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+    };
+
+    for (std::size_t batch_index = 0u; batch_index < s.batches.size(); ++batch_index) {
+        if (batch_index == s.rt_pass_before) shadow_pass();
+        const VkBatch &batch = s.batches[batch_index];
         const std::uint32_t address = batch.draw.framebuffer_address & 0x001FFFF0u;
         FramebufferTarget *target = address == current_address
             ? current_target : find_framebuffer_target(s, address);
@@ -2856,6 +3867,7 @@ std::uint32_t record_batches(VkGeState &s, FrameResources &frame, std::size_t pa
         }
     }
 
+    if (s.rt_pass_before == s.batches.size()) shadow_pass();
     end_rendering(s, cmd);
     if (current_target != nullptr)
         resolve_target_for_sampling(s, cmd, *current_target, false);
@@ -3040,6 +4052,15 @@ void ge_gpu_backend_observe_camera(const std::array<float, 12> &,
                                    const std::array<float, 3> &,
                                    const GeGpuDrawDescriptor &,
                                    std::uint32_t) noexcept {}
+
+void ge_gpu_backend_observe_sun(const std::array<float, 12> &view,
+                                const std::array<float, 3> &world_direction, float intensity) noexcept {
+    VkGeState &s = state();
+    if (!s.rt_active) return;
+    for (const VkGeState::SunObservation &seen : s.sun_observations)
+        if (seen.view == view && seen.world == world_direction && seen.intensity == intensity) return;
+    if (s.sun_observations.size() < 64u) s.sun_observations.push_back({view, world_direction, intensity});
+}
 
 bool ge_gpu_backend_stage_vertices(const GeGpuDrawDescriptor &, std::span<const GeGpuVertex> vertices) noexcept {
     VkGeState &s = state();
@@ -3536,6 +4557,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     }
 
     record_pending_texture_uploads(s, frame);
+    rt_prepare_frame(s, s.frame_cursor, frame.cmd);
     bool touched_display = false;
     const std::uint32_t executed_batches = record_batches(s, frame, packed_offset, index_offset, touched_display);
 

@@ -91,6 +91,9 @@ struct GeGpuDrawDescriptor {
 struct GeGpuHardwareTransform {
     std::array<float, 16> model_to_clip{};
     std::array<float, 4> model_to_view_z{};
+    std::array<float, 16> model_to_view{};  // column-major; ray-traced shadows rebuild the scene with it
+    std::array<float, 12> view{};           // the GE view matrix (4x3) of the draw
+    std::array<float, 12> world{};          // the GE world matrix (4x3) the vertices are drawn with
     float viewport_scale_x{};
     float viewport_scale_y{};
     float viewport_scale_z{};
@@ -324,6 +327,13 @@ void ge_gpu_backend_observe_camera(const std::array<float, 12> &view,
                                    const std::array<float, 3> &camera_position,
                                    const GeGpuDrawDescriptor &draw,
                                    std::uint32_t vertex_weight) noexcept;
+
+// Rendering.RayTracedShadows: the game's directional light (peds and cars), which follows the sun,
+// seen by a lit draw with GE view matrix `view` (HUD models use their own camera and light).
+// `world_direction` points towards the light; `intensity` is its mean diffuse level.
+void ge_gpu_backend_observe_sun(const std::array<float, 12> &view,
+                                const std::array<float, 3> &world_direction,
+                                float intensity) noexcept;
 
 [[nodiscard]] bool ge_gpu_backend_stage_vertices(
     const GeGpuDrawDescriptor &draw,

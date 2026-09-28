@@ -1,4 +1,4 @@
-    #pragma once
+#pragma once
 
 #include <cstdint>
 
@@ -41,6 +41,9 @@ void lcs_menu_install(psprecomp::GuestMemory &memory, std::uint32_t scratch_addr
 [[nodiscard]] std::int32_t lcs_menu_tab_count() noexcept;
 // When the current tab is QUIT, selects its page and returns true.
 [[nodiscard]] bool lcs_menu_tab_screen(psprecomp::GuestMemory &memory, std::uint32_t menu) noexcept;
+// True when `screen` is the QUIT page. The game's screen change treats leaving that (otherwise
+// unused) screen as "close the pause menu", so the generated code skips that case for it.
+[[nodiscard]] bool lcs_menu_is_quit_screen(std::uint32_t screen) noexcept;
 // When Cross is pressed on the QUIT page's YES item, closes the game and returns true.
 [[nodiscard]] bool lcs_menu_quit_press(psprecomp::GuestMemory &memory, std::uint32_t menu) noexcept;
 

@@ -2535,6 +2535,8 @@ void ge_gpu_backend_observe_camera(const std::array<float, 12> &,
                                    const std::array<float, 3> &,
                                    const GeGpuDrawDescriptor &,
                                    std::uint32_t) noexcept {}
+void ge_gpu_backend_observe_sun(const std::array<float, 12> &, const std::array<float, 3> &,
+                                float) noexcept {}
 
 bool ge_gpu_backend_stage_vertices(const GeGpuDrawDescriptor &, std::span<const GeGpuVertex> vertices) noexcept {
     Dx12GeState &s = state();
@@ -3520,6 +3522,8 @@ void ge_gpu_backend_observe_camera(const std::array<float, 12> &,
                                    const std::array<float, 3> &,
                                    const GeGpuDrawDescriptor &,
                                    std::uint32_t) noexcept {}
+void ge_gpu_backend_observe_sun(const std::array<float, 12> &, const std::array<float, 3> &,
+                                float) noexcept {}
 bool ge_gpu_backend_stage_vertices(const GeGpuDrawDescriptor &, std::span<const GeGpuVertex>) noexcept { return false; }
 bool ge_gpu_backend_texture_needed(const GeGpuDrawDescriptor &) noexcept { return false; }
 void ge_gpu_backend_prepare_texture_keys(GeGpuDrawDescriptor &) noexcept {}
