@@ -242,7 +242,7 @@ private:
     void poll_tcp();
     void close_ptp_socket(PtpSocket &socket);
     [[nodiscard]] MatchContext *find_context(std::int32_t id);
-    void send_frame_to_lobby_server(const std::vector<std::uint8_t> &payload);
+    void send_frame_to_lobby_server(std::uint8_t type, const std::vector<std::uint8_t> &payload);
 
     bool running_{false};
     Mac mac_{};
@@ -271,6 +271,8 @@ private:
     std::string lobby_server_;
     std::pair<std::uint32_t, std::uint16_t> lobby_server_addr_;
     std::uint64_t last_lobby_heartbeat_ms_{0};
+    std::uint64_t last_room_list_request_ms_{0};
+    std::vector<ScanEntry> lobby_rooms_;  // persistent rooms from the lobby server, merged into scan_results()
 };
 
 }  // namespace lcs

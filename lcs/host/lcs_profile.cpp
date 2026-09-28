@@ -4372,7 +4372,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 return;
             }
             rt.memory().zero(dest, 128u);
-            const std::string nickname = "PLAYER";
+            const std::string &nickname = lcs_render_configuration().multiplayer.nickname;
             rt.memory().copy_in(dest, std::vector<std::uint8_t>(nickname.begin(), nickname.end()));
             set_success(ctx);
         });

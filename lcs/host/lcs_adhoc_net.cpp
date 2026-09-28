@@ -66,8 +66,13 @@ constexpr std::size_t kMaxPtpBuffer = 1u << 20;
 // + the 32-byte presence payload (group + nickname). Not something a real PSP ever sends; the
 // server builds it because a relayed frame's UDP source is the server itself, not the original
 // player, so the true address has to travel inside the payload instead.
+// kFrameRoomList / kFrameRoomListReply: ask the lobby server for its persistent room list (rooms it
+// has seen a group name for at least once, kept listed even with nobody currently in them) and merge
+// the reply into scan_results() so the game's native "join game" screen shows them too - Join() only
+// reads the group name from a scan entry (see lcs_adhoc.cpp), so a room with no live peer works fine
+// with a placeholder MAC. Reply payload: repeated 9-byte entries (name[8] + activeCount[1]).
 enum FrameType : std::uint8_t { kFramePresence = 1, kFrameMatch = 2, kFramePdp = 3, kFrameProbe = 4,
-                                kFrameLobbyPeer = 5 };
+                                kFrameLobbyPeer = 5, kFrameRoomList = 6, kFrameRoomListReply = 7 };
 enum MatchSub : std::uint8_t {
     kSubHello = 1,
     kSubRequest = 2,
@@ -389,6 +394,15 @@ void AdhocNet::handle_frame(std::uint8_t type, const Mac &source, const Mac &des
         endpoint.group.assign(reinterpret_cast<const char *>(payload + 8), strnlen(reinterpret_cast<const char *>(payload + 8), 8u));
         endpoint.nickname.assign(reinterpret_cast<const char *>(payload + 16),
                                  strnlen(reinterpret_cast<const char *>(payload + 16), 24u));
+    } else if (type == kFrameRoomListReply) {
+        lobby_rooms_.clear();
+        for (std::size_t offset = 0u; offset + 9u <= length; offset += 9u) {
+            ScanEntry entry;
+            entry.name.assign(reinterpret_cast<const char *>(payload + offset),
+                              strnlen(reinterpret_cast<const char *>(payload + offset), 8u));
+            entry.mac = Mac{};  // placeholder: Join() only reads the group name (lcs_adhoc.cpp)
+            if (!entry.name.empty()) lobby_rooms_.push_back(std::move(entry));
+        }
     } else if (type == kFrameProbe) {
         last_presence_ms_ = 0u;  // announce our group on the next poll
     } else if (type == kFrameMatch) {
@@ -440,6 +454,13 @@ std::vector<ScanEntry> AdhocNet::scan_results() const {
         if (endpoint.group.empty() || now - endpoint.seen_ms > 5000u) continue;
         results.push_back(ScanEntry{endpoint.group, mac});
     }
+    // Persistent lobby rooms nobody is currently broadcasting from, skipping names already covered
+    // by a live peer above.
+    for (const ScanEntry &room : lobby_rooms_) {
+        const bool live = std::any_of(results.begin(), results.end(),
+                                      [&](const ScanEntry &entry) { return entry.name == room.name; });
+        if (!live) results.push_back(room);
+    }
     return results;
 }
 
@@ -457,7 +478,12 @@ bool AdhocNet::pop_ctl_event(CtlEvent &out) {
     if (out.event == kCtlScan) {
         const auto found = scan_results();
         std::string names;
-        for (const ScanEntry &entry : found) names += " '" + entry.name + "'";
+        for (const ScanEntry &entry : found) {
+            // scan_results() gives a live peer's real mac, or Mac{} for a lobby-only room with no
+            // live broadcaster (see scan_results()) - that's the tell for where an entry came from.
+            const bool from_lobby = entry.mac == Mac{};
+            names += " '" + entry.name + "'" + (from_lobby ? "(lobby, no live peer)" : "(live)");
+        }
         NETLOG("scan finished, groups seen:" << (names.empty() ? " none" : names));
     }
     ctl_events_.pop_front();
@@ -1005,31 +1031,25 @@ void AdhocNet::poll_tcp() {
     }
 }
 
-void AdhocNet::send_frame_to_lobby_server(const std::vector<std::uint8_t> &payload) {
+void AdhocNet::send_frame_to_lobby_server(std::uint8_t type, const std::vector<std::uint8_t> &payload) {
     if (!running_) return;
 
-    // Crear frame de presencia igual al que enviamos por broadcast
     std::vector<std::uint8_t> frame;
     frame.reserve(kFrameHeader + payload.size());
 
-    // Cabecera LCSN
     for (int i = 0; i < 4; ++i) frame.push_back(static_cast<std::uint8_t>((kFrameMagic >> (8 * i)) & 0xFFu));
     frame.push_back(kFrameVersion);
-    frame.push_back(kFramePresence);  // Tipo: Presencia
-    put16(frame, static_cast<std::uint16_t>(payload.size()));  // Longitud del payload
+    frame.push_back(type);
+    put16(frame, static_cast<std::uint16_t>(payload.size()));
 
-    // MACs
-    frame.insert(frame.end(), mac_.begin(), mac_.end());                      // MAC origen (yo)
-    frame.insert(frame.end(), kBroadcastMac.begin(), kBroadcastMac.end());   // MAC destino (broadcast)
+    frame.insert(frame.end(), mac_.begin(), mac_.end());
+    frame.insert(frame.end(), kBroadcastMac.begin(), kBroadcastMac.end());
 
-    // Puertos
-    put16(frame, udp_port_);  // Mi puerto UDP
-    put16(frame, tcp_port_);  // Mi puerto TCP
+    put16(frame, udp_port_);
+    put16(frame, tcp_port_);
 
-    // Payload (grupo + nickname)
     frame.insert(frame.end(), payload.begin(), payload.end());
 
-    // Enviar al servidor de lobby
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = lobby_server_addr_.first;
@@ -1037,8 +1057,6 @@ void AdhocNet::send_frame_to_lobby_server(const std::vector<std::uint8_t> &paylo
 
     sendto(as_socket(udp_socket_), reinterpret_cast<const char *>(frame.data()),
            static_cast<int>(frame.size()), kSendFlags, reinterpret_cast<sockaddr *>(&server_addr), sizeof(server_addr));
-
-    NETLOG("heartbeat sent to lobby server");
 }
 
 // --------------------------------------------------------------------------------------- polling
@@ -1054,9 +1072,13 @@ void AdhocNet::poll() {
         std::memcpy(payload.data() + 8, nickname_.data(), std::min<std::size_t>(nickname_.size(), 24u));
         send_frame(kFramePresence, kBroadcastMac, payload);
 
-        if (lobby_server_addr_.first != 0u) {  // Si está configurado
-            send_frame_to_lobby_server(payload);
+        if (lobby_server_addr_.first != 0u) {
+            send_frame_to_lobby_server(kFramePresence, payload);
         }
+    }
+    if (lobby_server_addr_.first != 0u && now - last_room_list_request_ms_ >= 3000u) {
+        last_room_list_request_ms_ = now;
+        send_frame_to_lobby_server(kFrameRoomList, {});
     }
     poll_matching();
     poll_tcp();

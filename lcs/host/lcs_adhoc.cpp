@@ -63,6 +63,25 @@ bool diag() {
     return enabled;
 }
 
+// Temporary aid for reverse-engineering the game's own multiplayer packet format (player position,
+// health, weapon, ...), which the host never parses - PDP/PTP just move opaque bytes. Zero cost when
+// the env var isn't set. Remove once the packet layout is documented.
+bool net_dump_player() {
+    static const bool enabled = std::getenv("LCS_NET_DUMP_PLAYER") != nullptr;
+    return enabled;
+}
+
+std::string hex_dump(const std::uint8_t *data, std::size_t length) {
+    static const char kDigits[] = "0123456789abcdef";
+    std::string text;
+    text.reserve(length * 2u);
+    for (std::size_t i = 0u; i < length; ++i) {
+        text.push_back(kDigits[data[i] >> 4u]);
+        text.push_back(kDigits[data[i] & 0xFu]);
+    }
+    return text;
+}
+
 Mac read_mac(psprecomp::Runtime &rt, std::uint32_t address) {
     Mac mac{};
     if (address != 0u && rt.memory().contains(address, 6u)) rt.memory().copy_out(address, mac);
@@ -382,6 +401,11 @@ void install_adhoc_hle(psprecomp::Runtime &runtime, const AdhocHooks &hooks) {
     // sceNetAdhocPdpSend(id, destination mac, port, data, length, timeout, nonblock)
     runtime.register_hle("sceNetAdhoc", 0xABED3790u, [](Rt &rt, Ctx &ctx) {
         const std::vector<std::uint8_t> data = read_bytes(rt, ctx.gpr[7], ctx.gpr[8]);
+        if (net_dump_player()) {
+            const Mac destination = read_mac(rt, ctx.gpr[5]);
+            NETLOG("PDP send id=" << ctx.gpr[4] << " dst=" << net_mac_text(destination) << " port=" << ctx.gpr[6]
+                                  << " len=" << data.size() << " hex=" << hex_dump(data.data(), data.size()));
+        }
         ctx.set_gpr(2, state().net.pdp_send(ctx.gpr[4], read_mac(rt, ctx.gpr[5]), static_cast<std::uint16_t>(ctx.gpr[6]),
                                             data.data(), static_cast<std::uint32_t>(data.size())));
     });
@@ -399,6 +423,10 @@ void install_adhoc_hle(psprecomp::Runtime &runtime, const AdhocHooks &hooks) {
             if (ctx.gpr[8] != 0u) rt.memory().store32(ctx.gpr[8], count);
             write_mac(rt, ctx.gpr[5], packet.mac);
             if (ctx.gpr[6] != 0u && rt.memory().contains(ctx.gpr[6], 2u)) rt.memory().store16(ctx.gpr[6], packet.port);
+            if (net_dump_player())
+                NETLOG("PDP recv id=" << ctx.gpr[4] << " src=" << net_mac_text(packet.mac) << " port=" << packet.port
+                                      << " len=" << packet.data.size() << " hex="
+                                      << hex_dump(packet.data.data(), packet.data.size()));
         }
         (void)settle(rt, ctx, result, ctx.gpr[9], ctx.gpr[10]);
     });
@@ -442,6 +470,9 @@ void install_adhoc_hle(psprecomp::Runtime &runtime, const AdhocHooks &hooks) {
         State &st = state();
         const std::uint32_t length = ctx.gpr[6] != 0u ? rt.memory().load32(ctx.gpr[6]) : 0u;
         const std::vector<std::uint8_t> data = read_bytes(rt, ctx.gpr[5], length);
+        if (net_dump_player())
+            NETLOG("PTP send id=" << ctx.gpr[4] << " len=" << data.size() << " hex="
+                                  << hex_dump(data.data(), data.size()));
         st.net.poll();
         (void)settle(rt, ctx, st.net.ptp_send(ctx.gpr[4], data.data(), static_cast<std::uint32_t>(data.size())),
                      ctx.gpr[7], ctx.gpr[8]);
@@ -459,6 +490,9 @@ void install_adhoc_hle(psprecomp::Runtime &runtime, const AdhocHooks &hooks) {
             if (received != 0u && rt.memory().contains(ctx.gpr[5], received))
                 rt.memory().copy_in(ctx.gpr[5], std::span<const std::uint8_t>(buffer.data(), received));
             if (ctx.gpr[6] != 0u) rt.memory().store32(ctx.gpr[6], received);
+            if (net_dump_player())
+                NETLOG("PTP recv id=" << ctx.gpr[4] << " len=" << received << " hex="
+                                      << hex_dump(buffer.data(), received));
         }
         (void)settle(rt, ctx, result, ctx.gpr[7], ctx.gpr[8]);
     });
