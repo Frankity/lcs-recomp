@@ -271,6 +271,16 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.HDR expects true/false");
         return;
     }
+    if (key == "raytracedshadows" || key == "rtshadows") {
+        if (!parse_bool(value, config.rendering.ray_traced_shadows))
+            warning(config, line, "Rendering.RayTracedShadows expects true/false");
+        return;
+    }
+    if (key == "shadowstrength") {
+        if (!parse_float(value, 0.0f, 1.0f, config.rendering.shadow_strength))
+            warning(config, line, "Rendering.ShadowStrength must be between 0 and 1");
+        return;
+    }
     if (key == "fxaa") {
         if (!parse_bool(value, config.rendering.fxaa))
             warning(config, line, "Rendering.FXAA expects true/false");
@@ -310,9 +320,24 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
         }
         return;
     }
+    if (key == "fieldofview" || key == "fov") {
+        if (!parse_float(value, 0.75f, 1.75f, config.rendering.field_of_view))
+            warning(config, line, "Rendering.FieldOfView must be between 0.75 and 1.75");
+        return;
+    }
     if (key == "drawdistance" || key == "populationdistance") {
         if (!parse_float(value, 0.5f, 4.0f, config.rendering.draw_distance))
             warning(config, line, "Rendering.DrawDistance must be between 0.5 and 4");
+        return;
+    }
+    if (key == "peddensity" || key == "pedestriandensity") {
+        if (!parse_float(value, 0.5f, 4.0f, config.rendering.ped_density))
+            warning(config, line, "Rendering.PedDensity must be between 0.5 and 4");
+        return;
+    }
+    if (key == "trafficdensity" || key == "cardensity") {
+        if (!parse_float(value, 0.5f, 4.0f, config.rendering.traffic_density))
+            warning(config, line, "Rendering.TrafficDensity must be between 0.5 and 4");
         return;
     }
     if (key == "bloom") {
@@ -871,6 +896,7 @@ const LcsConfiguration &lcs_render_configuration() {
 
 namespace {
 std::atomic<float> g_fog_distance_scale{-1.0f};  // negative until first read
+std::atomic<float> g_field_of_view_scale{-1.0f};  // negative until first read
 }
 
 PostProcessSettings &lcs_post_settings() noexcept {
@@ -885,6 +911,7 @@ PostProcessSettings &lcs_post_settings() noexcept {
         settings.fxaa.store(rendering.fxaa);
         settings.ambient_light.store(rendering.ambient_light);
         settings.directional_light.store(rendering.directional_light);
+        settings.shadow_strength.store(rendering.shadow_strength);
         return true;
     }();
     (void)initialized;
@@ -902,6 +929,28 @@ float lcs_fog_distance_scale() noexcept {
 
 void lcs_set_fog_distance_scale(float scale) noexcept {
     g_fog_distance_scale.store(std::max(scale, 0.0f), std::memory_order_relaxed);
+}
+
+void lcs_set_field_of_view_scale(float scale) noexcept {
+    g_field_of_view_scale.store(std::max(scale, 0.1f), std::memory_order_relaxed);
+}
+
+float lcs_min_timestep(float game_min) noexcept {
+    static const bool high_rate = global_configuration().timing.frame_rate > 60u;
+    return high_rate ? std::min(game_min, 0.2f) : game_min;
+}
+
+float lcs_camera_fov(float game_fov) noexcept {
+    float scale = g_field_of_view_scale.load(std::memory_order_relaxed);
+    if (scale < 0.0f) {
+        scale = global_configuration().rendering.field_of_view;
+        g_field_of_view_scale.store(scale, std::memory_order_relaxed);
+    }
+    if (scale == 1.0f || !(game_fov > 0.0f) || !(game_fov < 180.0f)) return game_fov;
+    // Scaling the tangent keeps zoomed views (sniper, camera) in proportion.
+    constexpr float kDegreesToHalfRadians = 3.14159265f / 360.0f;
+    const float half = std::atan(std::tan(game_fov * kDegreesToHalfRadians) * scale);
+    return std::clamp(half / kDegreesToHalfRadians, 1.0f, 150.0f);
 }
 
 bool lcs_save_config_value(const std::string &section, const std::string &key,

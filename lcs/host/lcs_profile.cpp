@@ -3,6 +3,8 @@
 #include "lcs_profile.hpp"
 #include "display_window.hpp"
 #include "lcs_menu.hpp"
+#include "lcs_population.hpp"
+#include "lcs_render_config.hpp"
 #include "lcs_adhoc.hpp"
 #include "lcs_ge_exec.hpp"
 #include "lcs_sas.hpp"
@@ -1050,7 +1052,16 @@ struct DisplayState {
 };
 DisplayState display_state;
 std::uint64_t display_vblank_index{};
-constexpr std::uint64_t kVblankPeriodUs = 16683u;
+// The PSP's 59.94 Hz vertical blank. The game waits for one every frame, so with Timing.FrameRate
+// above 60 the virtual one runs at that rate instead (the game's timestep follows real time).
+std::uint64_t vblank_period_us() {
+    static const std::uint64_t period = [] {
+        const LcsConfiguration &config = lcs_render_configuration();
+        if (!config.initialized || config.timing.frame_rate <= 60u) return std::uint64_t{16683u};
+        return std::uint64_t{1000000u} / config.timing.frame_rate;
+    }();
+    return period;
+}
 
 struct GeCallbackRecord {
     std::uint32_t signal_function{};
@@ -1577,7 +1588,7 @@ bool dispatch_vblank_interrupt(psprecomp::Runtime &rt, psprecomp::AllegrexContex
     current->second.suspended_context = handler;
     current->second.delay_until_us = virtual_time_us + delay_us;
     current->second.delay_sequence = thread_table.next_delay_sequence++;
-    g_vblank_interrupt_due_us = virtual_time_us + delay_us + kVblankPeriodUs;
+    g_vblank_interrupt_due_us = virtual_time_us + delay_us + vblank_period_us();
     hang_trace("vblank-interrupt delay=" + std::to_string(delay_us) +
                " resume=" + psprecomp::hex32(frame.resume.pc));
     if (!activate_next_thread(ctx, "vblank-interrupt"))
@@ -1812,7 +1823,7 @@ std::uint32_t throttle_vblank_to_real_time() {
     static const bool skip_time = std::getenv("LCS_NO_VBLANK_SKIP") == nullptr;
     constexpr std::uint32_t kMaxSkippedVblanks = 6u;
     static std::chrono::steady_clock::time_point next_vblank{};
-    const auto period = std::chrono::microseconds(kVblankPeriodUs);
+    const auto period = std::chrono::microseconds(vblank_period_us());
     const auto now = std::chrono::steady_clock::now();
     if (next_vblank == std::chrono::steady_clock::time_point{}) {
         next_vblank = now + period;
@@ -2477,7 +2488,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     module_thread.name = "module_start";
     module_thread.priority = 32u;
     module_thread.stack_size = 0x10000u;
-    module_thread.stack_top = 0x0A000000u;
+    module_thread.stack_top = lcs_guest_stack_top();
     module_thread.stack_bottom = module_thread.stack_top - module_thread.stack_size;
     module_thread.kernel_context = module_thread.stack_top - 0x100u;
     thread_table.next_stack_top = module_thread.stack_bottom;
@@ -3986,8 +3997,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         });
     runtime.register_hle("sceDisplay", 0x4D4E10ECu,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
-            const std::uint64_t blank = kVblankPeriodUs / 5u;
-            const std::uint64_t phase = virtual_time_us % kVblankPeriodUs;
+            const std::uint64_t blank = vblank_period_us() / 5u;
+            const std::uint64_t phase = virtual_time_us % vblank_period_us();
             ctx.set_gpr(2, phase < blank ? 1u : 0u);
         });
     runtime.register_hle("sceDisplay", 0x9C6EAAD7u,
@@ -4041,6 +4052,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
 
         display_window_pump();
         lcs_menu_tick(rt.memory());
+        lcs_population_tick(rt.memory());
         if (display_window_closed()) {
             ge_worker_wait_idle();
             rt.stop("Display window closed");
@@ -4049,7 +4061,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         audio_output_advance(virtual_time_us);
         const auto throttle_started = std::chrono::steady_clock::now();
         if (const std::uint32_t skipped = throttle_vblank_to_real_time(); skipped != 0u) {
-            virtual_time_us += static_cast<std::uint64_t>(skipped) * kVblankPeriodUs;
+            virtual_time_us += static_cast<std::uint64_t>(skipped) * vblank_period_us();
             display_vblank_index += skipped;
         }
         g_speed_throttle_ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -4057,8 +4069,8 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         report_realtime_speed_if_requested(rt, display_vblank_index);
         static const bool fixed_delay = std::getenv("LCS_VBLANK_FIXED_DELAY") != nullptr;
         const std::uint32_t vblank_delay = fixed_delay
-            ? static_cast<std::uint32_t>(kVblankPeriodUs)
-            : static_cast<std::uint32_t>((virtual_time_us / kVblankPeriodUs + 1u) * kVblankPeriodUs -
+            ? static_cast<std::uint32_t>(vblank_period_us())
+            : static_cast<std::uint32_t>((virtual_time_us / vblank_period_us() + 1u) * vblank_period_us() -
                                          virtual_time_us);
         if (deliver_pending_ge_callback(ctx, vblank_delay, true)) return;
         if (dispatch_vblank_interrupt(rt, ctx, vblank_delay)) return;

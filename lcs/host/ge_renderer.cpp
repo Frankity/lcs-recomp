@@ -865,6 +865,11 @@ GeGpuHardwareTransform build_gpu_hardware_transform(
     hw.model_to_clip = multiply_mat4(transform.projection, model_to_view);
     hw.model_to_view_z = {model_to_view[2], model_to_view[6],
                           model_to_view[10], model_to_view[14]};
+    hw.model_to_view = model_to_view;
+    hw.view = transform.view;
+    hw.world = vertices_already_in_world_space
+        ? std::array<float, 12>{1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f}
+        : transform.world;
     hw.viewport_scale_x = decode_float24(data24(commands[0x42u]));
     hw.viewport_scale_y = decode_float24(data24(commands[0x43u]));
     hw.viewport_scale_z = decode_float24(data24(commands[0x44u]));
@@ -1129,6 +1134,23 @@ PreparedLighting prepare_lighting(bool has_vertex_color,
         prepared.specular = rgb_command(commands[0x91u + light * 3u]);
     }
     return state;
+}
+
+// The game lights peds and cars with one directional light that follows the time of day; the
+// strongest directional light of a lit draw is taken as the sun for the ray-traced shadows.
+void observe_sun_light(const PreparedLighting &lighting, const std::array<float, 12> &view) noexcept {
+    const PreparedLight *sun = nullptr;
+    float strongest = 0.0f;
+    for (const PreparedLight &light : lighting.lights) {
+        if (!light.enabled || light.type != 0u) continue;
+        const float level = (light.diffuse.r + light.diffuse.g + light.diffuse.b) / 3.0f;
+        if (level > strongest) {
+            strongest = level;
+            sun = &light;
+        }
+    }
+    if (sun == nullptr) return;
+    ge_gpu_backend_observe_sun(view, {sun->vector.x, sun->vector.y, sun->vector.z}, strongest);
 }
 
 Color apply_prepared_lighting(Color input, Vec3 world_position, Vec3 world_normal,
@@ -4144,6 +4166,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
                     lighting_cache.valid = true;
                 }
             }
+            observe_sun_light(prepared_lighting, transform.view);
         }
         static thread_local std::vector<std::uint32_t> occurrence_indices;
         static thread_local std::vector<std::uint32_t> unique_indices;

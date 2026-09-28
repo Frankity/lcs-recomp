@@ -71,8 +71,8 @@ void log_write_watch(std::uint32_t address, std::size_t length, const char *oper
 
 GuestMemory::GuestMemory(std::uint32_t size_bytes)
     : vram_(kVramSize, 0u), bytes_(size_bytes, 0u), write_watch_enabled_(std::getenv("PSPRECOMP_WATCH_WRITE") != nullptr) {
-    if (size_bytes != 32u * 1024u * 1024u && size_bytes != 64u * 1024u * 1024u) {
-        throw Error("PSP RAM size must be 32 MiB or 64 MiB");
+    if (size_bytes < 4u) {
+        throw Error("PSP RAM size must be at least 4 bytes");
     }
     // Bind the inline AOT fast paths to main RAM.  bytes_ is never resized
     // afterwards, and the instance is non-copyable, so this stays valid.

@@ -3,6 +3,7 @@
 #include "psprecomp/runtime.hpp"
 #include "lcs_profile.hpp"
 #include "lcs_menu.hpp"
+#include "lcs_population.hpp"
 #include "display_window.hpp"
 #include "lcs_audio_output.hpp"
 #include "ge_gpu_backend.hpp"
@@ -54,7 +55,7 @@ int main(int argc, char **argv) {
         elf_path = psprecomp::resolve_path_case_insensitive(elf_path);
         auto elf = psprecomp::Elf32Image::from_file(elf_path);
 
-        psprecomp::Runtime runtime;
+        psprecomp::Runtime runtime(lcs::lcs_population_guest_ram_bytes());
         runtime.set_game_root(game_root);
 
         const auto stats = elf.load_and_relocate(runtime.memory(), psprecomp::kDefaultPspUserLoadBase);
@@ -80,6 +81,8 @@ int main(int argc, char **argv) {
         lcs::lcs_menu_install(runtime.memory(), menu_scratch);
         if (!lcs::lcs_apply_lod_scale(runtime.memory(), lcs::lcs_render_configuration().rendering.lod_scale))
             std::cerr << "[lod] LOD distance constant not found; LodScale ignored\n";
+        if (!lcs::lcs_population_install(runtime.memory()))
+            std::cerr << "[population] density constants not found; PedDensity/TrafficDensity ignored\n";
         lcs::display_window_init();
         lcs::install_profile(runtime, user_arena_start);
 
