@@ -120,6 +120,7 @@ struct RenderingConfiguration {
     ReflectionMode reflections{ReflectionMode::Off};  // screen-space reflections on ground surfaces
     float lod_scale{2.0f};  // multiplies the distances at which the game switches to lower detail
     float draw_distance{1.5f};  // multiplies the distance at which pedestrians and cars are generated
+    float view_distance{1.0f};  // multiplies the camera's far clip, fog plane and world LOD distance
     float ped_density{1.0f};      // multiplies how many pedestrians the game keeps around (1 = PSP)
     float traffic_density{1.0f};  // multiplies how many cars the game keeps around (1 = PSP)
     float field_of_view{1.0f};  // multiplies the tangent of the camera's half field of view

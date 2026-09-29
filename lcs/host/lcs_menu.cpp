@@ -152,6 +152,8 @@ struct DrawDistanceChoice {
 };
 constexpr std::array<DrawDistanceChoice, 5> kDrawDistanceChoices{{
     {"0.5X", 0.5f, "0.5"}, {"1X", 1.0f, "1.0"}, {"1.5X", 1.5f, "1.5"}, {"2X", 2.0f, "2.0"}, {"3X", 3.0f, "3.0"}}};
+constexpr std::array<DrawDistanceChoice, 5> kViewDistanceChoices{{
+    {"1X", 1.0f, "1.0"}, {"1.5X", 1.5f, "1.5"}, {"2X", 2.0f, "2.0"}, {"3X", 3.0f, "3.0"}, {"4X", 4.0f, "4.0"}}};
 constexpr std::array<FloatChoice, 2> kFxaaChoices{{{"OFF", 0.0f, "false"}, {"ON", 1.0f, "true"}}};
 constexpr std::array<FloatChoice, 7> kLightChoices{{
     {"60%", 0.6f, "0.6"}, {"80%", 0.8f, "0.8"}, {"100%", 1.0f, "1.0"}, {"120%", 1.2f, "1.2"},
@@ -211,6 +213,7 @@ std::string multiplier_text(std::uint32_t value) {
 }
 
 float g_population_scale{1.0f};  // see lcs_population_distance_scale()
+float g_view_distance_scale{1.0f};  // see lcs_view_distance_scale()
 
 Option g_options[] = {
     {"FEX_RES", "RESOLUTION", 6u,
@@ -388,6 +391,22 @@ Option g_options[] = {
      [](std::uint32_t i) { return std::string(kBloomModes[i].name); },
      [](std::uint32_t i) { return lcs_save_config_value("Rendering", "Reflections", kBloomModes[i].value); },
      0u, 0u, nullptr, 2u},
+    {"FEX_VWD", "VIEW DISTANCE", static_cast<std::uint32_t>(kViewDistanceChoices.size()),
+     [](const Config &c) {
+         std::uint32_t best = 0u;
+         for (std::uint32_t i = 1u; i < kViewDistanceChoices.size(); ++i)
+             if (std::abs(kViewDistanceChoices[i].scale - c.rendering.view_distance) <
+                 std::abs(kViewDistanceChoices[best].scale - c.rendering.view_distance))
+                 best = i;
+         return best;
+     },
+     [](std::uint32_t i) { return std::string(kViewDistanceChoices[i].name); },
+     [](std::uint32_t i) {
+         return lcs_save_config_value("Rendering", "ViewDistance", kViewDistanceChoices[i].value);
+     },
+     0u, 0u,
+     [](psprecomp::GuestMemory &, std::uint32_t i) { g_view_distance_scale = kViewDistanceChoices[i].scale; },
+     2u},
     {"FEX_HSC", "HUD SCALE", static_cast<std::uint32_t>(kHudScales.size()),
      [](const Config &c) {
          std::uint32_t best = 0u;
@@ -656,6 +675,7 @@ static void install_quit_tab(psprecomp::GuestMemory &memory, std::uint32_t scrat
 
 void lcs_menu_install(psprecomp::GuestMemory &memory, std::uint32_t scratch_address) {
     g_population_scale = lcs_render_configuration().rendering.draw_distance;
+    g_view_distance_scale = lcs_render_configuration().rendering.view_distance;
     g_scratch = scratch_address;
     install_pages(memory);
     install_quit_tab(memory, scratch_address);
@@ -720,6 +740,8 @@ bool lcs_menu_option_step(psprecomp::GuestMemory &memory, std::uint32_t menu,
 }
 
 float lcs_population_distance_scale() noexcept { return g_population_scale; }
+
+float lcs_view_distance_scale() noexcept { return g_view_distance_scale; }
 
 bool lcs_apply_lod_scale(psprecomp::GuestMemory &memory, float scale) noexcept {
     static bool verified = false;

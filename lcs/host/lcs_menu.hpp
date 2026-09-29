@@ -55,6 +55,11 @@ void lcs_menu_install(psprecomp::GuestMemory &memory, std::uint32_t scratch_addr
 // game's own distance). Set from Rendering.DrawDistance and changed live by the menu row.
 [[nodiscard]] float lcs_population_distance_scale() noexcept;
 
+// Factor the generated camera code multiplies the camera far clip, fog plane and world LOD
+// distance by (1.0 = the game's own distance). Set from Rendering.ViewDistance and changed live
+// by the menu row.
+[[nodiscard]] float lcs_view_distance_scale() noexcept;
+
 // Called once per frame: scrolls the Display list so the selected row stays visible.
 void lcs_menu_tick(psprecomp::GuestMemory &memory) noexcept;
 

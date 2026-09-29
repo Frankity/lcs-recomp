@@ -330,6 +330,11 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.DrawDistance must be between 0.5 and 4");
         return;
     }
+    if (key == "viewdistance") {
+        if (!parse_float(value, 1.0f, 4.0f, config.rendering.view_distance))
+            warning(config, line, "Rendering.ViewDistance must be between 1 and 4");
+        return;
+    }
     if (key == "peddensity" || key == "pedestriandensity") {
         if (!parse_float(value, 0.5f, 4.0f, config.rendering.ped_density))
             warning(config, line, "Rendering.PedDensity must be between 0.5 and 4");
