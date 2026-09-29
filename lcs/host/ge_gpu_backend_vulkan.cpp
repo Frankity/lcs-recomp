@@ -408,8 +408,8 @@ struct VkGeState {
     VkPipeline present_pipeline{};
     VkFormat present_pipeline_format{VK_FORMAT_UNDEFINED};
     // bloom: bright/down/blur/add pipelines and two half-resolution ping-pong pairs (1/4, 1/8)
-    std::array<VkPipeline, 4> bloom_pipelines{};
-    std::array<VkShaderModule, 4> bloom_shaders{};
+    std::array<VkPipeline, 5> bloom_pipelines{};
+    std::array<VkShaderModule, 5> bloom_shaders{};
     std::array<BloomTarget, 4> bloom_targets;
     bool bloom_ready{};
     bool bloom_failed{};
@@ -2141,7 +2141,8 @@ void bind_srv_and_sampler(VkGeState &s, VkCommandBuffer cmd, std::uint32_t srv, 
 // The scene is sampled at the end of the frame: bright pixels are extracted into a 1/4-size
 // texture, blurred, downsampled to 1/8 and blurred again; both are then added on top of the
 // presented image. Everything runs on small RGBA16F textures.
-enum BloomPipeline : std::size_t { kBloomBright = 0u, kBloomBlur = 1u, kBloomDown = 2u, kBloomAdd = 3u };
+enum BloomPipeline : std::size_t { kBloomBright = 0u, kBloomBlur = 1u, kBloomDown = 2u, kBloomAdd = 3u,
+                            kBloomVolume = 4u };
 
 struct BloomLook {
     float threshold;
@@ -2154,6 +2155,21 @@ BloomLook bloom_look(BloomMode mode) noexcept {
     case BloomMode::High: return {0.72f, 0.55f, 0.65f};
     case BloomMode::Low: return {0.85f, 0.32f, 0.32f};
     case BloomMode::Off: break;
+    }
+    return {1.0f, 0.0f, 0.0f};
+}
+
+struct VolumetricLook {
+    float threshold;  // brightness above which a pixel emits light
+    float reach;      // ray length in texels of the 1/4-size texture
+    float gain;
+};
+
+VolumetricLook volumetric_look(VolumetricMode mode) noexcept {
+    switch (mode) {
+    case VolumetricMode::High: return {0.70f, 6.0f, 0.90f};
+    case VolumetricMode::Low: return {0.82f, 4.0f, 0.55f};
+    case VolumetricMode::Off: break;
     }
     return {1.0f, 0.0f, 0.0f};
 }
@@ -2175,7 +2191,8 @@ bool ensure_bloom(VkGeState &s) noexcept {
         return false;
     }
     std::string error;
-    const std::array<const char *, 4> entries{"BloomBrightPS", "BloomBlurPS", "BloomDownPS", "BloomAddPS"};
+    const std::array<const char *, 5> entries{"BloomBrightPS", "BloomBlurPS", "BloomDownPS", "BloomAddPS",
+                                              "VolumetricPS"};
     for (std::size_t i = 0u; i < entries.size(); ++i) {
         if (s.bloom_shaders[i] == VK_NULL_HANDLE)
             s.bloom_shaders[i] = compile_shader(s, kGePresentShaderHlsl, "LCSNativeVulkanGEBloom",
@@ -2275,8 +2292,13 @@ std::uint32_t bloom_sampler(VkGeState &s) noexcept {
 // Renders the bloom textures from `source`. Returns false when bloom is off or unavailable.
 bool record_bloom(VkGeState &s, VkCommandBuffer cmd, const FramebufferTarget &source) noexcept {
     const BloomMode mode = lcs_render_configuration().rendering.bloom;
-    if (mode == BloomMode::Off || !ensure_bloom(s)) return false;
+    const VolumetricMode volumetric = lcs_render_configuration().rendering.volumetric;
+    const bool bloom_on = mode != BloomMode::Off;
+    const bool volumetric_on = volumetric != VolumetricMode::Off;
+    if ((!bloom_on && !volumetric_on) || !ensure_bloom(s)) return false;
     const BloomLook look = bloom_look(mode);
+    const VolumetricLook vlook = volumetric_look(volumetric);
+    const float threshold = bloom_on ? look.threshold : vlook.threshold;
     const std::uint32_t sampler = bloom_sampler(s);
     BloomTarget &q0 = s.bloom_targets[0];
     BloomTarget &q1 = s.bloom_targets[1];
@@ -2286,16 +2308,21 @@ bool record_bloom(VkGeState &s, VkCommandBuffer cmd, const FramebufferTarget &so
     const VkPipeline blur = s.bloom_pipelines[kBloomBlur];
     const VkPipeline down = s.bloom_pipelines[kBloomDown];
     bloom_pass(s, cmd, bright, source.srv_index, s.target_width, s.target_height, q0, sampler, 0.0f, 0.0f,
-               look.threshold);
+               threshold);
     for (int i = 0; i < 2; ++i) {
         bloom_pass(s, cmd, blur, q0.srv_index, q0.width, q0.height, q1, sampler, 1.0f, 0.0f, 0.0f);
         bloom_pass(s, cmd, blur, q1.srv_index, q1.width, q1.height, q0, sampler, 0.0f, 1.0f, 0.0f);
     }
-    bloom_pass(s, cmd, down, q0.srv_index, q0.width, q0.height, e0, sampler, 0.0f, 0.0f, 0.0f);
-    for (int i = 0; i < 2; ++i) {
-        bloom_pass(s, cmd, blur, e0.srv_index, e0.width, e0.height, e1, sampler, 1.0f, 0.0f, 0.0f);
-        bloom_pass(s, cmd, blur, e1.srv_index, e1.width, e1.height, e0, sampler, 0.0f, 1.0f, 0.0f);
+    if (bloom_on) {
+        bloom_pass(s, cmd, down, q0.srv_index, q0.width, q0.height, e0, sampler, 0.0f, 0.0f, 0.0f);
+        for (int i = 0; i < 2; ++i) {
+            bloom_pass(s, cmd, blur, e0.srv_index, e0.width, e0.height, e1, sampler, 1.0f, 0.0f, 0.0f);
+            bloom_pass(s, cmd, blur, e1.srv_index, e1.width, e1.height, e0, sampler, 0.0f, 1.0f, 0.0f);
+        }
     }
+    if (volumetric_on)  // q1 is free after the blurs: the scattered light goes there
+        bloom_pass(s, cmd, s.bloom_pipelines[kBloomVolume], q0.srv_index, q0.width, q0.height, q1, sampler,
+                   0.0f, 0.0f, vlook.reach);
     return true;
 }
 
@@ -2320,10 +2347,16 @@ void composite_bloom(VkGeState &s, VkCommandBuffer cmd, const PresentationRectan
     look.far_gain *= gain_scale;
     const std::uint32_t sampler = bloom_sampler(s);
     const VkPipeline add = s.bloom_pipelines[kBloomAdd];
-    bloom_draw(s, cmd, add, s.bloom_targets[0].srv_index, sampler, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-               look.near_gain);
-    bloom_draw(s, cmd, add, s.bloom_targets[2].srv_index, sampler, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-               look.far_gain);
+    if (look.near_gain > 0.0f || look.far_gain > 0.0f) {
+        bloom_draw(s, cmd, add, s.bloom_targets[0].srv_index, sampler, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                   look.near_gain);
+        bloom_draw(s, cmd, add, s.bloom_targets[2].srv_index, sampler, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                   look.far_gain);
+    }
+    const VolumetricLook vlook = volumetric_look(lcs_render_configuration().rendering.volumetric);
+    if (vlook.gain > 0.0f)
+        bloom_draw(s, cmd, add, s.bloom_targets[1].srv_index, sampler, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                   vlook.gain);
 }
 
 // Acquires the next swapchain image; the submission that draws it must wait on `image_available`.
