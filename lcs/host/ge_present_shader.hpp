@@ -139,6 +139,26 @@ float4 BloomBlurPS(PresentVertexOutput i) : SV_TARGET {
     sum += (BloomTap(i.uv + step * 3.2307692308) + BloomTap(i.uv - step * 3.2307692308)) * 0.0702702703;
     return float4(sum, 1.0);
 }
+// Volumetric light: every pixel gathers the blurred bright buffer along 8 rays and the rays are
+// weighted by distance, so lights (street lamps, headlights, the sun) scatter into the haze around
+// them. BloomTexel.xy is the texel size of the source, BloomParams.x the ray length in texels.
+float4 VolumetricPS(PresentVertexOutput i) : SV_TARGET {
+    const int kSteps = 10;
+    float jitter = frac(sin(dot(i.uv, float2(12.9898, 78.233))) * 43758.5453);
+    float3 sum = 0.0;
+    float total = 0.0;
+    [unroll] for (int d = 0; d < 8; ++d) {
+        float angle = float(d) * 0.7853981634;
+        float2 dir = float2(cos(angle), sin(angle)) * BloomTexel.xy * BloomParams.x;
+        [unroll] for (int s = 1; s <= kSteps; ++s) {
+            float t = (float(s) - jitter) / float(kSteps);
+            float w = exp(-2.5 * t);
+            sum += BloomTap(i.uv + dir * (t * float(kSteps))) * w;
+            total += w;
+        }
+    }
+    return float4(sum / max(total, 1.0e-4), 1.0);
+}
 float4 BloomAddPS(PresentVertexOutput i) : SV_TARGET {
     return float4(BloomTap(i.uv) * BloomParams.y, 0.0);
 }
