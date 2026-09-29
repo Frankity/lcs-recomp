@@ -101,6 +101,23 @@ std::uint16_t get16(const std::uint8_t *in) {
     return static_cast<std::uint16_t>(in[0] | (in[1] << 8u));
 }
 
+// Temporary aid: capture a real kSubHello opt (136 bytes) as a template for a server-side "fake
+// host" room broadcast. Remove once a real capture has been taken.
+bool net_dump_hello() {
+    static const bool enabled = std::getenv("LCS_NET_DUMP_HELLO") != nullptr;
+    return enabled;
+}
+std::string hello_hex_dump(const std::uint8_t *data, std::size_t length) {
+    static const char kDigits[] = "0123456789abcdef";
+    std::string text;
+    text.reserve(length * 2u);
+    for (std::size_t i = 0u; i < length; ++i) {
+        text.push_back(kDigits[data[i] >> 4u]);
+        text.push_back(kDigits[data[i] & 0xFu]);
+    }
+    return text;
+}
+
 SOCKET as_socket(std::uintptr_t value) { return static_cast<SOCKET>(value); }
 void close_socket(std::uintptr_t &value) {
     if (value != kNoSocket) closesocket(as_socket(value));
@@ -143,7 +160,7 @@ void net_log(const std::string &line) {
     static int lines = 0;
     static std::FILE *file = nullptr;
     static const bool to_console = std::getenv("LCS_NET_DIAG") != nullptr;
-    if (lines >= 20000) return;
+    if (lines >= 2000000) return;
     ++lines;
     if (file == nullptr && g_log_port != 0) {
         char name[64];
@@ -330,7 +347,14 @@ void AdhocNet::send_frame(std::uint8_t type, const Mac &destination, const std::
     };
 
     if (destination != kBroadcastMac) {
-        if (const auto known = endpoints_.find(destination); known != endpoints_.end()) {
+        const auto known = endpoints_.find(destination);
+        if (net_dump_hello() && (type == kFrameMatch))
+            NETLOG("send_frame unicast type=" << static_cast<int>(type) << " to " << mac_text(destination)
+                                              << (known != endpoints_.end()
+                                                      ? " known ip=" + std::to_string(known->second.ip_be) +
+                                                            " port=" + std::to_string(known->second.udp_port)
+                                                      : " NOT IN endpoints_ (falling back to broadcast)"));
+        if (known != endpoints_.end()) {
             send_to(known->second.ip_be, known->second.udp_port);
             return;
         }
@@ -465,10 +489,14 @@ std::vector<ScanEntry> AdhocNet::scan_results() const {
 }
 
 std::optional<std::string> AdhocNet::peer_name(const Mac &mac) const {
+    // Used by GetNameByAddr, which the game also calls to validate a matching Hello from a host
+    // that is NOT (and never will be) in our own group_ - a host broadcasts under its own session
+    // name, not the joiner's rendezvous group - so this must not require found->second.group ==
+    // group_. Requiring that made every real Hello fail this check and get silently dropped
+    // (FUN_00206708 in the game's own matching-event dispatcher rejects it), so "Select Game to
+    // Join" never showed a row for a real host: any recently-seen peer's nickname resolves.
     const auto found = endpoints_.find(mac);
-    if (found == endpoints_.end() || group_.empty() || found->second.group != group_ ||
-        now_ms() - found->second.seen_ms > 10000u)
-        return std::nullopt;
+    if (found == endpoints_.end() || now_ms() - found->second.seen_ms > 10000u) return std::nullopt;
     return found->second.nickname;
 }
 
@@ -620,6 +648,9 @@ void AdhocNet::handle_match(const Mac &source, const std::uint8_t *payload, std:
 
         switch (sub) {
         case kSubHello:
+            if (net_dump_hello())
+                NETLOG("HELLO opt from " << mac_text(source) << " len=" << opt.size()
+                                         << " hex=" << hello_hex_dump(opt.data(), opt.size()));
             if (client_like && (existing == context.peers.end() || existing->second.state != 3))
                 queue_match_event(context, kMatchHello, source, std::move(opt));
             break;
@@ -687,6 +718,9 @@ void AdhocNet::poll_matching() {
             const std::uint64_t interval = std::max<std::uint64_t>(context.settings.hello_us / 1000u, 250u);
             if (now - context.last_hello_ms >= interval) {
                 context.last_hello_ms = now;
+                if (net_dump_hello() && !context.hello_opt.empty())
+                    NETLOG("HELLO opt SENT len=" << context.hello_opt.size() << " hex="
+                                                 << hello_hex_dump(context.hello_opt.data(), context.hello_opt.size()));
                 send_match(context, kBroadcastMac, kSubHello, context.hello_opt);
             }
         }
@@ -758,7 +792,12 @@ std::uint32_t AdhocNet::pdp_send(std::uint32_t id, const Mac &destination, std::
     payload.insert(payload.end(), data, data + length);
     send_frame(kFramePdp, destination, payload);
     static int traced = 0;
-    if (traced++ < 40) NETLOG("pdp send id " << id << " " << length << " bytes to " << mac_text(destination) << ":" << port);
+    if (traced++ < 40)
+        NETLOG("pdp send id " << id << " " << length << " bytes to " << mac_text(destination) << ":" << port);
+    static int traced_big = 0;
+    if (length >= 50u && traced_big++ < 200)
+        NETLOG("pdp send BIG id " << id << " " << length << " bytes to " << mac_text(destination) << ":" << port
+                                   << " hex=" << hello_hex_dump(data, length));
     return 0u;
 }
 
@@ -964,17 +1003,26 @@ void AdhocNet::poll_tcp() {
             make_nonblocking(accepted);
             int nodelay = 1;
             setsockopt(accepted, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
+            NETLOG("ptp raw tcp accept fd " << accepted);
             unassigned_.push_back(UnassignedConnection{static_cast<std::uintptr_t>(accepted), {}, now});
         }
     }
-    // Incoming connections send a header naming the source and the port they want.
+    // Incoming connections send a header naming the source and the port they want. A connection can
+    // sit here for a little while with its header already fully read, if it arrives before the game
+    // has gotten around to calling sceNetAdhocPtpListen() for the logical port it's addressed to -
+    // don't call recv() again once the header is complete (want==0): recv(fd, buf, 0, 0) itself
+    // returns 0 on Linux, which used to be indistinguishable from "peer closed" and dropped the
+    // connection on literally the next poll, before the listener ever had a chance to show up.
     for (auto it = unassigned_.begin(); it != unassigned_.end();) {
-        std::uint8_t buffer[kPtpHeader];
-        const int want = static_cast<int>(kPtpHeader - it->header.size());
-        const int got = recv(as_socket(it->socket), reinterpret_cast<char *>(buffer), want, 0);
         bool drop = false;
-        if (got > 0) it->header.insert(it->header.end(), buffer, buffer + got);
-        else if (got == 0 || !would_block()) drop = true;
+        const bool header_was_complete = it->header.size() == kPtpHeader;
+        if (!header_was_complete) {
+            std::uint8_t buffer[kPtpHeader];
+            const int want = static_cast<int>(kPtpHeader - it->header.size());
+            const int got = recv(as_socket(it->socket), reinterpret_cast<char *>(buffer), want, 0);
+            if (got > 0) it->header.insert(it->header.end(), buffer, buffer + got);
+            else if (got == 0 || !would_block()) drop = true;
+        }
         if (!drop && it->header.size() == kPtpHeader) {
             std::uint32_t magic = 0;
             for (int i = 0; i < 4; ++i) magic |= static_cast<std::uint32_t>(it->header[i]) << (8 * i);
@@ -982,13 +1030,21 @@ void AdhocNet::poll_tcp() {
             std::memcpy(source.data(), it->header.data() + 4, 6);
             const std::uint16_t source_port = get16(it->header.data() + 16);
             const std::uint16_t destination_port = get16(it->header.data() + 18);
+            if (!header_was_complete)
+                NETLOG("ptp raw header magic=" << std::hex << magic << std::dec << " src=" << mac_text(source)
+                                                << " src_port=" << source_port << " dst_port=" << destination_port);
             if (magic != kPtpMagic) {
+                NETLOG("ptp raw header bad magic, dropping");
                 drop = true;
             } else {
                 PtpSocket *listener = nullptr;
-                for (auto &[id, socket] : ptp_sockets_)
+                for (auto &[id, socket] : ptp_sockets_) {
+                    NETLOG("ptp raw candidate listener id " << id << " state " << static_cast<int>(socket.state)
+                                                              << " source_port " << socket.source_port);
                     if (socket.state == PtpState::Listening && socket.source_port == destination_port) listener = &socket;
+                }
                 if (listener != nullptr) {
+                    NETLOG("ptp raw header matched listener, queued as pending");
                     listener->pending.push_back(PtpPending{it->socket, source, source_port});
                     it = unassigned_.erase(it);
                     continue;
@@ -999,6 +1055,8 @@ void AdhocNet::poll_tcp() {
             drop = true;
         }
         if (drop) {
+            NETLOG("ptp raw unassigned fd " << it->socket << " dropped (header " << it->header.size()
+                                             << "/" << kPtpHeader << " bytes)");
             close_socket(it->socket);
             it = unassigned_.erase(it);
         } else {
@@ -1023,9 +1081,13 @@ void AdhocNet::poll_tcp() {
             if (got > 0) {
                 if (socket.rx.empty()) socket.first_rx_ms = now;
                 socket.rx.insert(socket.rx.end(), buffer, buffer + got);
+                NETLOG("ptp established id " << id << " rx +" << got << " (total " << socket.rx.size() << ")");
                 continue;
             }
-            if (got == 0 || !would_block()) socket.state = PtpState::Closed;
+            if (got == 0 || !would_block()) {
+                NETLOG("ptp established id " << id << " recv closed (got=" << got << ")");
+                socket.state = PtpState::Closed;
+            }
             break;
         }
     }
@@ -1076,7 +1138,7 @@ void AdhocNet::poll() {
             send_frame_to_lobby_server(kFramePresence, payload);
         }
     }
-    if (lobby_server_addr_.first != 0u && now - last_room_list_request_ms_ >= 3000u) {
+    if (lobby_server_addr_.first != 0u && now - last_room_list_request_ms_ >= 60000u) {
         last_room_list_request_ms_ = now;
         send_frame_to_lobby_server(kFrameRoomList, {});
     }
