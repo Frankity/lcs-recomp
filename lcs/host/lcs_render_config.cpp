@@ -364,6 +364,18 @@ void apply_rendering_key(LcsConfiguration &config, const std::string &key,
             warning(config, line, "Rendering.Volumetric expects Off, Low or High");
         return;
     }
+    if (key == "reflections" || key == "reflection" || key == "ssr") {
+        const std::string mode = lowercase_copy(trim_copy(value));
+        if (mode == "off" || mode == "false" || mode == "0" || mode == "none")
+            config.rendering.reflections = ReflectionMode::Off;
+        else if (mode == "low" || mode == "on" || mode == "true" || mode == "1")
+            config.rendering.reflections = ReflectionMode::Low;
+        else if (mode == "high")
+            config.rendering.reflections = ReflectionMode::High;
+        else
+            warning(config, line, "Rendering.Reflections expects Off, Low or High");
+        return;
+    }
     if (key == "msaa" || key == "multisampling") {
         std::uint32_t samples = 0u;
         if (!parse_u32(value, 1u, 16u, samples)) {
@@ -1028,6 +1040,15 @@ const char *volumetric_mode_name(VolumetricMode mode) noexcept {
     case VolumetricMode::Off: return "Off";
     case VolumetricMode::Low: return "Low";
     case VolumetricMode::High: return "High";
+    }
+    return "Off";
+}
+
+const char *reflection_mode_name(ReflectionMode mode) noexcept {
+    switch (mode) {
+    case ReflectionMode::Off: return "Off";
+    case ReflectionMode::Low: return "Low";
+    case ReflectionMode::High: return "High";
     }
     return "Off";
 }

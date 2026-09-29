@@ -43,6 +43,12 @@ enum class VolumetricMode : std::uint8_t {
     High,
 };
 
+enum class ReflectionMode : std::uint8_t {
+    Off,
+    Low,
+    High,
+};
+
 enum class RenderingBackend : std::uint8_t {
     Software,
     DirectX12,
@@ -111,6 +117,7 @@ struct RenderingConfiguration {
     bool smaa{false};
     BloomMode bloom{BloomMode::Low};  // glow around bright lights, added when presenting
     VolumetricMode volumetric{VolumetricMode::Off};  // light scattering (haze) around bright lights
+    ReflectionMode reflections{ReflectionMode::Off};  // screen-space reflections on ground surfaces
     float lod_scale{2.0f};  // multiplies the distances at which the game switches to lower detail
     float draw_distance{1.5f};  // multiplies the distance at which pedestrians and cars are generated
     float ped_density{1.0f};      // multiplies how many pedestrians the game keeps around (1 = PSP)
@@ -242,6 +249,7 @@ void lcs_set_field_of_view_scale(float scale) noexcept;
 [[nodiscard]] const char *rendering_backend_name(RenderingBackend backend) noexcept;
 [[nodiscard]] const char *bloom_mode_name(BloomMode mode) noexcept;
 [[nodiscard]] const char *volumetric_mode_name(VolumetricMode mode) noexcept;
+[[nodiscard]] const char *reflection_mode_name(ReflectionMode mode) noexcept;
 
 [[nodiscard]] float resolve_widescreen_aspect_ratio(
     const LcsConfiguration &configuration,

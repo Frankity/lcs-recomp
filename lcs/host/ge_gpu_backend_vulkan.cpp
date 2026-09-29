@@ -457,6 +457,22 @@ struct VkGeState {
     std::size_t rt_pass_before{std::numeric_limits<std::size_t>::max()};  // batch index (size() = after all)
     std::uint32_t rt_target{};
     RtShadowConstants rt_constants{};
+    // screen-space reflections (Rendering.Reflections)
+    bool ssr_active{};  // all reflection resources were created
+    VkDescriptorSetLayout ssr_set_layout{};
+    VkPipelineLayout ssr_pipeline_layout{};
+    VkDescriptorPool ssr_descriptor_pool{};
+    VkSampler ssr_depth_sampler{};
+    VkSampler ssr_color_sampler{};
+    VkShaderModule ssr_shader{};
+    VkPipeline ssr_pipeline{};
+    struct SsrFrame {
+        VkDescriptorSet set{};
+        GpuBufferPtr constants;
+    };
+    std::array<SsrFrame, kFrameCount> ssr_frames;
+    std::size_t ssr_pass_before{std::numeric_limits<std::size_t>::max()};  // batch index (size() = after all)
+    std::uint32_t ssr_target{};
     struct SunObservation {
         std::array<float, 12> view{};
         std::array<float, 3> world{};
@@ -1710,10 +1726,10 @@ bool ensure_framebuffer_target(VkGeState &s, std::uint32_t address, std::string 
     }
     target.depth = create_image(s, s.target_width, s.target_height, 1u, s.depth_format, s.sample_count,
                                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                                    (s.rt_active ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u),
+                                    ((s.rt_active || s.ssr_active) ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u),
                                 s.depth_aspect, "framebuffer depth", error);
     if (!target.depth) return false;
-    if (s.rt_active) {
+    if (s.rt_active || s.ssr_active) {
         auto holder = std::make_shared<ImageViewHolder>();
         holder->device = s.device;
         VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -3121,16 +3137,20 @@ bool invert_matrix(const std::array<float, 16> &m, std::array<float, 16> &out) n
     return true;
 }
 
-// Captures this frame's scene, uploads it and records the acceleration structure builds (outside
-// any rendering scope). Sets s.rt_pass_before when the shadow pass should be drawn.
-void rt_prepare_frame(VkGeState &s, std::uint32_t slot, VkCommandBuffer cmd) noexcept {
-    s.rt_pass_before = std::numeric_limits<std::size_t>::max();
-    if (!s.rt_active) return;
-    static const float debug = [] {
-        const char *text = std::getenv("LCS_RT_DEBUG");
-        return text != nullptr ? static_cast<float>(std::atof(text)) : 0.0f;
-    }();
+// The camera of the main 3D scene of this frame: the framebuffer that received the most 3D geometry,
+// the batch after which its opaque geometry is complete, and the view/projection matrices needed to
+// go from its depth buffer to view space and back. Shared by the shadow and reflection passes.
+struct SceneCamera {
+    std::uint32_t address{};
+    FramebufferTarget *target{};
+    std::size_t last_scene_batch{};
+    std::array<float, 12> view{};
+    std::array<float, 16> clip_to_view{};
+    std::array<float, 16> view_to_clip{};
+    std::array<float, 16> world_to_view{};
+};
 
+bool find_scene_camera(VkGeState &s, SceneCamera &out) noexcept {
     // The main scene is the framebuffer that received the most 3D geometry.
     std::unordered_map<std::uint32_t, std::uint64_t> scene_vertices;
     for (const VkBatch &batch : s.batches)
@@ -3142,7 +3162,7 @@ void rt_prepare_frame(VkGeState &s, std::uint32_t slot, VkCommandBuffer cmd) noe
     for (const auto &[candidate, vertices] : scene_vertices)
         if (vertices > most) { most = vertices; address = candidate; }
     FramebufferTarget *target = find_framebuffer_target(s, address);
-    if (most == 0u || target == nullptr || !target->depth_sample) return;
+    if (most == 0u || target == nullptr || !target->depth_sample) return false;
 
     // The camera is the one of the largest shadow-casting draw.
     std::size_t last_scene_batch = std::numeric_limits<std::size_t>::max();
@@ -3158,8 +3178,8 @@ void rt_prepare_frame(VkGeState &s, std::uint32_t slot, VkCommandBuffer cmd) noe
             camera = &batch;
         }
     }
-    if (camera == nullptr) return;
-    const std::array<float, 12> &view = camera->transform.view;
+    if (camera == nullptr) return false;
+    const std::array<float, 12> &view = camera->transform.view;  // valid while s.batches is untouched
 
     // view -> framebuffer mapping: clip = T * model and view = M * model, so clip = T * M^-1 * view.
     const std::uint32_t logical_width = target->logical_width != 0u ? target->logical_width : kReferenceWidth;
@@ -3167,7 +3187,7 @@ void rt_prepare_frame(VkGeState &s, std::uint32_t slot, VkCommandBuffer cmd) noe
     const TransformConstants constants = make_transform_constants(*camera, logical_width, logical_height);
     const std::array<std::array<float, 4>, 4> rows{constants.row0, constants.row1, constants.row2, constants.row3};
     std::array<float, 16> view_to_model{};
-    if (!invert_matrix(camera->transform.model_to_view, view_to_model)) return;
+    if (!invert_matrix(camera->transform.model_to_view, view_to_model)) return false;
     std::array<float, 16> view_to_clip{};
     for (std::size_t c = 0u; c < 4u; ++c)
         for (std::size_t r = 0u; r < 4u; ++r) {
@@ -3176,8 +3196,37 @@ void rt_prepare_frame(VkGeState &s, std::uint32_t slot, VkCommandBuffer cmd) noe
             view_to_clip[c * 4u + r] = sum;
         }
     std::array<float, 16> clip_to_view{};
-    if (!invert_matrix(view_to_clip, clip_to_view)) return;
+    if (!invert_matrix(view_to_clip, clip_to_view)) return false;
     const std::array<float, 16> world_to_view = affine_to_matrix(view);
+    out.address = address;
+    out.target = target;
+    out.last_scene_batch = last_scene_batch;
+    out.view = view;
+    out.clip_to_view = clip_to_view;
+    out.view_to_clip = view_to_clip;
+    out.world_to_view = world_to_view;
+    return true;
+}
+
+// Captures this frame's scene, uploads it and records the acceleration structure builds (outside
+// any rendering scope). Sets s.rt_pass_before when the shadow pass should be drawn.
+void rt_prepare_frame(VkGeState &s, std::uint32_t slot, VkCommandBuffer cmd) noexcept {
+    s.rt_pass_before = std::numeric_limits<std::size_t>::max();
+    if (!s.rt_active) return;
+    static const float debug = [] {
+        const char *text = std::getenv("LCS_RT_DEBUG");
+        return text != nullptr ? static_cast<float>(std::atof(text)) : 0.0f;
+    }();
+
+    SceneCamera scene_camera;
+    if (!find_scene_camera(s, scene_camera)) return;
+    const std::uint32_t address = scene_camera.address;
+    FramebufferTarget *target = scene_camera.target;
+    const std::size_t last_scene_batch = scene_camera.last_scene_batch;
+    const std::array<float, 12> &view = scene_camera.view;
+    const std::array<float, 16> &clip_to_view = scene_camera.clip_to_view;
+    const std::array<float, 16> &view_to_clip = scene_camera.view_to_clip;
+    const std::array<float, 16> &world_to_view = scene_camera.world_to_view;
     std::array<float, 16> world_to_clip{};
     for (std::size_t c = 0u; c < 4u; ++c)
         for (std::size_t r = 0u; r < 4u; ++r) {
@@ -3497,6 +3546,306 @@ void rt_record_shadow_pass(VkGeState &s, VkCommandBuffer cmd, FramebufferTarget 
     begin_rendering(s, cmd, target, false, false);
 }
 
+constexpr float kSsrDistance = 150.0f;   // view-space units (metres in the game) reflections reach from the camera
+constexpr float kSsrFirstStep = 0.35f;   // first ray step in metres; steps grow geometrically
+
+// ---- screen-space reflections (Rendering.Reflections) ------------------------------------------
+// After the last opaque 3D draw of the main scene a full-screen pass rebuilds each pixel's view-space
+// position and normal from the depth buffer. Pixels that face up (roads, pavements, roofs) march a
+// reflected ray through the depth buffer; where it hits something the colour found there is blended
+// in, more at grazing angles (Fresnel). Only what is on screen can be reflected.
+
+// std140 layout of SsrConstants in the GLSL.
+struct SsrConstants {
+    std::array<float, 16> clip_to_view{};
+    std::array<float, 16> view_to_clip{};
+    std::array<float, 4> up{};       // xyz: world up in view space
+    std::array<float, 4> params{};   // xy target size, z strength, w reflection distance
+    std::array<float, 4> quality{};  // x steps, y thickness, z first step, w step growth
+};
+static_assert(sizeof(SsrConstants) == 176u);
+
+constexpr char kSsrShaderGlsl[] = R"GLSL(
+#version 460
+#if LCS_MSAA
+layout(set = 0, binding = 0) uniform sampler2DMS DepthBuffer;
+#else
+layout(set = 0, binding = 0) uniform sampler2D DepthBuffer;
+#endif
+layout(set = 0, binding = 1) uniform sampler2D SceneColor;
+layout(set = 0, binding = 2, std140) uniform SsrConstants {
+    mat4 ClipToView;
+    mat4 ViewToClip;
+    vec4 Up;
+    vec4 Params;   // xy target size, z strength, w reflection distance
+    vec4 Quality;  // x steps, y thickness, z first step, w step growth
+};
+layout(location = 0) out vec4 Reflection;
+
+float DepthAt(ivec2 p) { return texelFetch(DepthBuffer, clamp(p, ivec2(0), ivec2(Params.xy) - 1), 0).r; }
+
+vec3 ViewAt(ivec2 p) {
+    vec2 ndc = vec2((float(p.x) + 0.5) / Params.x * 2.0 - 1.0, 1.0 - (float(p.y) + 0.5) / Params.y * 2.0);
+    vec4 v = ClipToView * vec4(ndc, DepthAt(p), 1.0);
+    return v.xyz / v.w;
+}
+
+void main() {
+    Reflection = vec4(0.0);
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    if (DepthAt(p) <= 0.0) return;  // nothing was drawn here (the depth buffer is cleared to 0)
+    vec3 position = ViewAt(p);
+    float distance_to_camera = length(position);
+    if (!(distance_to_camera < Params.w)) return;
+
+    // Surface normal from the neighbouring depths, taking the side that stays on the same surface.
+    vec3 dx1 = ViewAt(p + ivec2(1, 0)) - position, dx2 = position - ViewAt(p - ivec2(1, 0));
+    vec3 dy1 = ViewAt(p + ivec2(0, 1)) - position, dy2 = position - ViewAt(p - ivec2(0, 1));
+    vec3 normal = cross(dot(dx1, dx1) < dot(dx2, dx2) ? dx1 : dx2, dot(dy1, dy1) < dot(dy2, dy2) ? dy1 : dy2);
+    if (dot(normal, normal) < 1.0e-20) return;
+    normal = normalize(normal);
+    if (dot(normal, position) > 0.0) normal = -normal;  // the camera is at the origin
+
+    float ground = smoothstep(0.80, 0.95, dot(normal, normalize(Up.xyz)));
+    if (ground <= 0.0) return;
+    vec3 view_dir = normalize(position);
+    float fresnel = pow(1.0 - clamp(dot(normal, -view_dir), 0.0, 1.0), 4.0);
+    float amount = Params.z * mix(0.15, 1.0, fresnel) * ground *
+                   (1.0 - smoothstep(0.6, 1.0, distance_to_camera / Params.w));
+    if (amount <= 0.002) return;
+
+    vec3 ray = reflect(view_dir, normal);
+    float jitter = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+    float travelled = Quality.z * (0.5 + 0.5 * jitter);
+    int steps = int(Quality.x);
+    for (int i = 0; i < steps; ++i) {
+        vec3 sample_point = position + ray * travelled;
+        vec4 clip = ViewToClip * vec4(sample_point, 1.0);
+        if (clip.w <= 1.0e-4) break;
+        vec2 ndc = clip.xy / clip.w;
+        vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) break;
+        ivec2 q = ivec2(uv * Params.xy);
+        if (DepthAt(q) > 0.0) {
+            // the ray is behind the surface seen at this pixel, and not far behind it
+            float gap = length(sample_point) - length(ViewAt(q));
+            if (gap > 0.0 && gap < Quality.y * (1.0 + travelled * 0.15)) {
+                vec2 edge = min(uv, 1.0 - uv);
+                float fade = smoothstep(0.0, 0.1, min(edge.x, edge.y)) * (1.0 - 0.5 * float(i) / float(steps));
+                Reflection = vec4(texture(SceneColor, uv).rgb, amount * fade);
+                return;
+            }
+        }
+        travelled *= 1.0 + Quality.w;
+    }
+}
+)GLSL";
+
+struct SsrLook {
+    float strength;
+    float steps;
+    float thickness;
+    float growth;
+};
+
+SsrLook ssr_look(ReflectionMode mode) noexcept {
+    switch (mode) {
+    case ReflectionMode::High: return {0.60f, 48.0f, 0.5f, 0.08f};
+    case ReflectionMode::Low: return {0.40f, 24.0f, 0.6f, 0.10f};
+    case ReflectionMode::Off: break;
+    }
+    return {0.0f, 0.0f, 0.0f, 0.0f};
+}
+
+void ssr_log(const std::string &message) {
+    std::cerr << "[reflections] " << message << "\n";
+    runtime_log_error("vulkan ge reflections", message);
+}
+
+void ssr_destroy_resources(VkGeState &s) noexcept {
+    for (VkGeState::SsrFrame &frame : s.ssr_frames) frame = {};
+    if (s.ssr_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(s.device, s.ssr_pipeline, nullptr);
+    if (s.ssr_shader != VK_NULL_HANDLE) vkDestroyShaderModule(s.device, s.ssr_shader, nullptr);
+    if (s.ssr_depth_sampler != VK_NULL_HANDLE) vkDestroySampler(s.device, s.ssr_depth_sampler, nullptr);
+    if (s.ssr_color_sampler != VK_NULL_HANDLE) vkDestroySampler(s.device, s.ssr_color_sampler, nullptr);
+    if (s.ssr_descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(s.device, s.ssr_descriptor_pool, nullptr);
+    if (s.ssr_pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(s.device, s.ssr_pipeline_layout, nullptr);
+    if (s.ssr_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(s.device, s.ssr_set_layout, nullptr);
+    s.ssr_pipeline = VK_NULL_HANDLE;
+    s.ssr_shader = VK_NULL_HANDLE;
+    s.ssr_depth_sampler = VK_NULL_HANDLE;
+    s.ssr_color_sampler = VK_NULL_HANDLE;
+    s.ssr_descriptor_pool = VK_NULL_HANDLE;
+    s.ssr_pipeline_layout = VK_NULL_HANDLE;
+    s.ssr_set_layout = VK_NULL_HANDLE;
+    s.ssr_active = false;
+}
+
+// Creates the reflection pass (layout, descriptors, shader, pipeline). A failure only turns it off.
+bool ssr_create_resources(VkGeState &s, std::string &error) noexcept {
+    const VkDescriptorSetLayoutBinding bindings[]{
+        {0u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {1u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {2u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layout.bindingCount = 3u;
+    layout.pBindings = bindings;
+    VkResult result = vkCreateDescriptorSetLayout(s.device, &layout, nullptr, &s.ssr_set_layout);
+    if (result != VK_SUCCESS) { error = vk_text(result, "vkCreateDescriptorSetLayout(reflections)"); return false; }
+    VkPipelineLayoutCreateInfo pipeline_layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipeline_layout.setLayoutCount = 1u;
+    pipeline_layout.pSetLayouts = &s.ssr_set_layout;
+    result = vkCreatePipelineLayout(s.device, &pipeline_layout, nullptr, &s.ssr_pipeline_layout);
+    if (result != VK_SUCCESS) { error = vk_text(result, "vkCreatePipelineLayout(reflections)"); return false; }
+
+    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u * kFrameCount},
+                                       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFrameCount}};
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = kFrameCount;
+    pool.poolSizeCount = 2u;
+    pool.pPoolSizes = sizes;
+    result = vkCreateDescriptorPool(s.device, &pool, nullptr, &s.ssr_descriptor_pool);
+    if (result != VK_SUCCESS) { error = vk_text(result, "vkCreateDescriptorPool(reflections)"); return false; }
+    for (VkGeState::SsrFrame &frame : s.ssr_frames) {
+        VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocate.descriptorPool = s.ssr_descriptor_pool;
+        allocate.descriptorSetCount = 1u;
+        allocate.pSetLayouts = &s.ssr_set_layout;
+        result = vkAllocateDescriptorSets(s.device, &allocate, &frame.set);
+        if (result != VK_SUCCESS) { error = vk_text(result, "vkAllocateDescriptorSets(reflections)"); return false; }
+        frame.constants = create_buffer(s, sizeof(SsrConstants), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, false,
+                                        "reflection constants", error);
+        if (!frame.constants) return false;
+    }
+
+    VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sampler.magFilter = VK_FILTER_NEAREST;
+    sampler.minFilter = VK_FILTER_NEAREST;
+    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.maxAnisotropy = 1.0f;
+    result = vkCreateSampler(s.device, &sampler, nullptr, &s.ssr_depth_sampler);
+    if (result != VK_SUCCESS) { error = vk_text(result, "vkCreateSampler(reflection depth)"); return false; }
+    sampler.magFilter = VK_FILTER_LINEAR;
+    sampler.minFilter = VK_FILTER_LINEAR;
+    result = vkCreateSampler(s.device, &sampler, nullptr, &s.ssr_color_sampler);
+    if (result != VK_SUCCESS) { error = vk_text(result, "vkCreateSampler(reflection colour)"); return false; }
+
+    s.ssr_shader = compile_glsl(s, kSsrShaderGlsl, "LCSNativeVulkanReflections", shaderc_fragment_shader,
+                                s.sample_count != VK_SAMPLE_COUNT_1_BIT, error);
+    if (s.ssr_shader == VK_NULL_HANDLE) return false;
+
+    // Blends the reflected colour over the target with the pass's own alpha (the reflectivity).
+    PipelineDesc desc;
+    desc.vs = s.present_vertex_shader;
+    desc.vs_entry = "PresentVS";
+    desc.ps = s.ssr_shader;
+    desc.ps_entry = "main";
+    desc.samples = s.sample_count;
+    desc.blend.blendEnable = VK_TRUE;
+    desc.blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    desc.blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    desc.blend.colorBlendOp = VK_BLEND_OP_ADD;
+    desc.blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    desc.blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    desc.blend.alphaBlendOp = VK_BLEND_OP_ADD;
+    desc.blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+    desc.color_format = scene_format();
+    desc.layout = s.ssr_pipeline_layout;
+    s.ssr_pipeline = build_pipeline(s, desc, error);
+    return s.ssr_pipeline != VK_NULL_HANDLE;
+}
+
+// Fills this frame's constants and descriptors. Sets s.ssr_pass_before when the pass should be drawn.
+void ssr_prepare_frame(VkGeState &s, std::uint32_t slot) noexcept {
+    s.ssr_pass_before = std::numeric_limits<std::size_t>::max();
+    if (!s.ssr_active) return;
+    const SsrLook look = ssr_look(lcs_render_configuration().rendering.reflections);
+    if (look.strength <= 0.0f) return;
+    SceneCamera camera;
+    if (!find_scene_camera(s, camera)) return;
+    std::string error;
+    if (!ensure_feedback_copy(s, *camera.target, error)) {
+        ssr_log(error);
+        return;
+    }
+
+    SsrConstants constants;
+    constants.clip_to_view = camera.clip_to_view;
+    constants.view_to_clip = camera.view_to_clip;
+    // the game's world is z-up: its up axis in view space is the third column of world -> view
+    constants.up = {camera.world_to_view[8], camera.world_to_view[9], camera.world_to_view[10], 0.0f};
+    constants.params = {static_cast<float>(s.target_width), static_cast<float>(s.target_height), look.strength,
+                        kSsrDistance};
+    constants.quality = {look.steps, look.thickness, kSsrFirstStep, look.growth};
+    VkGeState::SsrFrame &frame = s.ssr_frames[slot];
+    std::memcpy(frame.constants->mapped, &constants, sizeof(constants));
+    flush_buffer(s, *frame.constants);
+
+    const VkDescriptorImageInfo depth{s.ssr_depth_sampler, camera.target->depth_sample->view,
+                                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    const VkDescriptorImageInfo color{s.ssr_color_sampler, camera.target->feedback_copy->view,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const VkDescriptorBufferInfo buffer{frame.constants->buffer, 0u, sizeof(SsrConstants)};
+    std::array<VkWriteDescriptorSet, 3> writes{};
+    for (std::uint32_t i = 0u; i < 3u; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = frame.set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1u;
+    }
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = &depth;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[1].pImageInfo = &color;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[2].pBufferInfo = &buffer;
+    vkUpdateDescriptorSets(s.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0u, nullptr);
+
+    s.ssr_target = camera.address;
+    s.ssr_pass_before = camera.last_scene_batch + 1u;
+}
+
+// Snapshots the target's colour, then blends the reflections over it; leaves `target` open for rendering.
+void ssr_record_pass(VkGeState &s, VkCommandBuffer cmd, FramebufferTarget &target, std::uint32_t slot) noexcept {
+    end_rendering(s, cmd);
+    resolve_target_for_sampling(s, cmd, target, false);
+    transition(cmd, target.color, target.color_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    transition(cmd, target.feedback_copy, target.feedback_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+    region.extent = {s.target_width, s.target_height, 1u};
+    vkCmdCopyImage(cmd, target.color->image, target.color_layout, target.feedback_copy->image,
+                   target.feedback_layout, 1u, &region);
+    transition(cmd, target.feedback_copy, target.feedback_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    transition(cmd, target.color, target.color_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    prepare_target_for_render(s, cmd, target);
+
+    transition(cmd, target.depth, target.depth_layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = render_view(target);
+    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea = {{0, 0}, {s.target_width, s.target_height}};
+    info.layerCount = 1u;
+    info.colorAttachmentCount = 1u;
+    info.pColorAttachments = &color;
+    vkCmdBeginRendering(cmd, &info);
+    set_scene_viewport(s, cmd);
+    vkCmdSetScissor(cmd, 0u, 1u, &info.renderArea);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.ssr_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.ssr_pipeline_layout, 0u, 1u,
+                            &s.ssr_frames[slot].set, 0u, nullptr);
+    vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
+    vkCmdEndRendering(cmd);
+    transition(cmd, target.depth, target.depth_layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    begin_rendering(s, cmd, target, false, false);
+}
+
 bool create_backend(VkGeState &s, std::string &error) noexcept {
     const InternalResolutionDimensions dims = resolve_internal_resolution(lcs_render_configuration().rendering);
     s.target_width = std::max<std::uint32_t>(1u, dims.width);
@@ -3558,6 +3907,16 @@ bool create_backend(VkGeState &s, std::string &error) noexcept {
             rt_destroy_resources(s);
         }
     }
+    if (lcs_render_configuration().rendering.reflections != ReflectionMode::Off) {
+        std::string ssr_error;
+        s.ssr_active = ssr_create_resources(s, ssr_error);
+        if (s.ssr_active) {
+            ssr_log("enabled");
+        } else {
+            ssr_log(ssr_error);
+            ssr_destroy_resources(s);
+        }
+    }
     if (!create_targets(s, error)) return false;
     s.vertices.reserve(262144u);
     s.packed_0115_vertices.reserve(2621440u);
@@ -3578,6 +3937,7 @@ void destroy_backend(VkGeState &s) noexcept {
     destroy_swapchain(s);
     if (s.device != VK_NULL_HANDLE) {
         rt_destroy_resources(s);
+        ssr_destroy_resources(s);
         for (FrameResources &frame : s.frames) {
             if (frame.image_available != VK_NULL_HANDLE) vkDestroySemaphore(s.device, frame.image_available, nullptr);
             frame = {};
@@ -3654,10 +4014,8 @@ std::uint32_t record_batches(VkGeState &s, FrameResources &frame, std::size_t pa
     bool active_vertex_layout_valid = false;
     VkPrimitiveTopology active_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
 
-    const auto shadow_pass = [&]() {
-        if (current_target == nullptr || current_address != s.rt_target) return;
-        rt_record_shadow_pass(s, cmd, *current_target, s.frame_cursor);
-        // the pass bound its own pipeline, layout, descriptors and scissor
+    // a full-screen pass bound its own pipeline, layout, descriptors and scissor
+    const auto forget_bound_state = [&]() {
         active_pipeline = VK_NULL_HANDLE;
         active_pipeline_key = std::numeric_limits<std::uint64_t>::max();
         bound_srv = std::numeric_limits<std::uint32_t>::max();
@@ -3668,9 +4026,20 @@ std::uint32_t record_batches(VkGeState &s, FrameResources &frame, std::size_t pa
         active_blend_fix = std::numeric_limits<std::uint32_t>::max();
         active_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     };
+    const auto shadow_pass = [&]() {
+        if (current_target == nullptr || current_address != s.rt_target) return;
+        rt_record_shadow_pass(s, cmd, *current_target, s.frame_cursor);
+        forget_bound_state();
+    };
+    const auto reflection_pass = [&]() {
+        if (current_target == nullptr || current_address != s.ssr_target) return;
+        ssr_record_pass(s, cmd, *current_target, s.frame_cursor);
+        forget_bound_state();
+    };
 
     for (std::size_t batch_index = 0u; batch_index < s.batches.size(); ++batch_index) {
         if (batch_index == s.rt_pass_before) shadow_pass();
+        if (batch_index == s.ssr_pass_before) reflection_pass();
         const VkBatch &batch = s.batches[batch_index];
         const std::uint32_t address = batch.draw.framebuffer_address & 0x001FFFF0u;
         FramebufferTarget *target = address == current_address
@@ -3901,6 +4270,7 @@ std::uint32_t record_batches(VkGeState &s, FrameResources &frame, std::size_t pa
     }
 
     if (s.rt_pass_before == s.batches.size()) shadow_pass();
+    if (s.ssr_pass_before == s.batches.size()) reflection_pass();
     end_rendering(s, cmd);
     if (current_target != nullptr)
         resolve_target_for_sampling(s, cmd, *current_target, false);
@@ -4591,6 +4961,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
 
     record_pending_texture_uploads(s, frame);
     rt_prepare_frame(s, s.frame_cursor, frame.cmd);
+    ssr_prepare_frame(s, s.frame_cursor);
     bool touched_display = false;
     const std::uint32_t executed_batches = record_batches(s, frame, packed_offset, index_offset, touched_display);
 
